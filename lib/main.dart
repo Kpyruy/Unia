@@ -6038,6 +6038,7 @@ class _SettingsPageState extends State<SettingsPage> {
     final cs = Theme.of(context).colorScheme;
     final l = AppL10n.of(appLocaleNotifier.value);
     final hidden = hiddenSubjectsNotifier.value.toList()..sort();
+    final bottomScrollPadding = MediaQuery.paddingOf(context).bottom + 32;
 
     return Scaffold(
       body: _AnimatedBackground(
@@ -6099,7 +6100,7 @@ class _SettingsPageState extends State<SettingsPage> {
             ),
 
             SliverPadding(
-              padding: const EdgeInsets.fromLTRB(16, 8, 16, 44),
+              padding: EdgeInsets.fromLTRB(16, 8, 16, bottomScrollPadding),
               sliver: SliverList(
                 delegate: SliverChildListDelegate([
                   const SizedBox(height: 8),
