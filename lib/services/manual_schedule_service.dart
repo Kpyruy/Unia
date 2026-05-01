@@ -7,6 +7,7 @@ class ManualScheduleService {
   static const int manualPersonType = 5;
   static const int manualPersonId = 900001;
   static const String storageKey = 'manualLessons';
+  static const int backupSchemaVersion = 1;
 
   static Future<List<ManualLessonDefinition>> loadDefinitions(
     SharedPreferences prefs,
@@ -38,6 +39,36 @@ class ManualScheduleService {
       storageKey,
       normalized.map((lesson) => jsonEncode(lesson.toJson())).toList(),
     );
+  }
+
+  static String encodeBackupJson(List<ManualLessonDefinition> definitions) {
+    final normalized = [...definitions]..sort(_compareDefinitions);
+    return jsonEncode({
+      'app': 'Unia',
+      'schemaVersion': backupSchemaVersion,
+      'manualLessons': normalized.map((lesson) => lesson.toJson()).toList(),
+    });
+  }
+
+  static List<ManualLessonDefinition> decodeBackupJson(String raw) {
+    final decoded = jsonDecode(raw);
+    if (decoded is! Map) return const [];
+    if ((decoded['schemaVersion'] as num?)?.toInt() != backupSchemaVersion) {
+      return const [];
+    }
+    final lessons = decoded['manualLessons'];
+    if (lessons is! List) return const [];
+
+    final definitions = lessons
+        .whereType<Map>()
+        .map(
+          (entry) =>
+              ManualLessonDefinition.fromJson(Map<String, dynamic>.from(entry)),
+        )
+        .where(_isValidBackupDefinition)
+        .toList();
+    definitions.sort(_compareDefinitions);
+    return definitions;
   }
 
   static Map<int, List<dynamic>> buildWeek(
@@ -77,6 +108,16 @@ class ManualScheduleService {
     final byDay = a.dayIndex.compareTo(b.dayIndex);
     if (byDay != 0) return byDay;
     return a.startTime.compareTo(b.startTime);
+  }
+
+  static bool _isValidBackupDefinition(ManualLessonDefinition definition) {
+    if (definition.id.trim().isEmpty) return false;
+    if (definition.dayIndex < 0 || definition.dayIndex > 4) return false;
+    if (definition.startTime < 0 || definition.startTime > 2359) return false;
+    if (definition.endTime < 0 || definition.endTime > 2359) return false;
+    if (definition.endTime <= definition.startTime) return false;
+    if (definition.subject.trim().isEmpty) return false;
+    return true;
   }
 }
 

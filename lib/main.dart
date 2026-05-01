@@ -21,6 +21,7 @@ import 'core/time_utils.dart';
 import 'services/notification_service.dart';
 import 'services/background_service.dart';
 import 'services/manual_schedule_service.dart';
+import 'services/schedule_backup_service.dart';
 import 'widgets/rounded_blur_app_bar.dart';
 
 part 'app/unia_app.dart';
@@ -45,6 +46,7 @@ void main() async {
   appVersion = packageInfo.version;
   appBuildNumber = packageInfo.buildNumber;
   await prefs.setString('installedAppVersion', appVersion);
+  await ScheduleBackupService.restoreIfNeeded(prefs);
   manualModeNotifier.value = prefs.getBool('manualMode') ?? false;
   final bool onboardingCompleted =
       prefs.getBool('onboardingCompleted') ?? false;
@@ -54,6 +56,10 @@ void main() async {
     profileName = prefs.getString('profileName') ?? "";
     personType = prefs.getInt('personType') ?? 0;
     personId = prefs.getInt('personId') ?? 0;
+    final definitions = await ManualScheduleService.loadDefinitions(prefs);
+    if (definitions.isNotEmpty) {
+      unawaited(ScheduleBackupService.writeDefinitions(definitions));
+    }
   }
   final savedLocale = prefs.getString('appLocale') ?? 'en';
   appLocaleNotifier.value = AppL10n.supportedLocales.contains(savedLocale)
@@ -382,6 +388,7 @@ class _WeeklyTimetablePageState extends State<WeeklyTimetablePage>
   ) async {
     final prefs = await SharedPreferences.getInstance();
     await ManualScheduleService.saveDefinitions(prefs, definitions);
+    await ScheduleBackupService.writeDefinitions(definitions);
     _manualLessons = definitions;
     await _fetchFullWeek(silent: true);
   }

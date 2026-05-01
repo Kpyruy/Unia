@@ -68,4 +68,44 @@ void main() {
       expect(loaded, [lesson]);
     },
   );
+
+  test('encodeBackupJson writes compact manual timetable backup', () {
+    const lesson = ManualLessonDefinition(
+      id: 'programming',
+      dayIndex: 1,
+      startTime: 945,
+      endTime: 1115,
+      subject: 'Programming',
+      subjectShort: 'PRG',
+      teacher: 'Alan Turing',
+      room: 'D404',
+    );
+
+    final raw = ManualScheduleService.encodeBackupJson([lesson]);
+
+    expect(raw, contains('"app":"Unia"'));
+    expect(raw, contains('"schemaVersion":1'));
+    expect(raw, contains('"manualLessons"'));
+    expect(ManualScheduleService.decodeBackupJson(raw), [lesson]);
+  });
+
+  test('decodeBackupJson ignores invalid and malformed lesson entries', () {
+    const raw =
+        '{"app":"Unia","schemaVersion":1,"manualLessons":[{"id":"ok","dayIndex":0,"startTime":800,"endTime":930,"subject":"Math","subjectShort":"MA","teacher":"","room":"A1"},"bad",{"id":"outside","dayIndex":8}]}';
+
+    final decoded = ManualScheduleService.decodeBackupJson(raw);
+
+    expect(decoded, [
+      const ManualLessonDefinition(
+        id: 'ok',
+        dayIndex: 0,
+        startTime: 800,
+        endTime: 930,
+        subject: 'Math',
+        subjectShort: 'MA',
+        teacher: '',
+        room: 'A1',
+      ),
+    ]);
+  });
 }

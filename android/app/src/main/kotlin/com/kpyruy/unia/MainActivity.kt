@@ -4,16 +4,25 @@ import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
+import android.content.ContentUris
+import android.content.ContentValues
 import android.content.Intent
 import android.graphics.Color
+import android.net.Uri
 import android.os.Build
+import android.os.Environment
+import android.provider.MediaStore
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.plugin.common.MethodChannel
+import java.io.File
 
 class MainActivity : FlutterActivity() {
 	companion object {
 		private const val CHANNEL = "unia/notifications"
+		private const val BACKUP_CHANNEL = "unia/schedule_backup"
+		private const val BACKUP_FILE_NAME = "unia_schedule_backup.json"
+		private const val BACKUP_FOLDER_NAME = "Unia"
 		private const val ACTION_EXTRA_KEY = "notification_action_id"
 		private const val CURRENT_LESSON_EXTRA_KEY = "notification_current_lesson"
 		private const val NEXT_LESSON_EXTRA_KEY = "notification_next_lesson"
@@ -35,7 +44,110 @@ class MainActivity : FlutterActivity() {
 			}
 		}
 
+		MethodChannel(flutterEngine.dartExecutor.binaryMessenger, BACKUP_CHANNEL)
+			.setMethodCallHandler { call, result ->
+				when (call.method) {
+					"writeScheduleBackup" -> {
+						val content = call.argument<String>("content").orEmpty()
+						result.success(content.isNotBlank() && writeScheduleBackup(content))
+					}
+					"readScheduleBackup" -> result.success(readScheduleBackup())
+					else -> result.notImplemented()
+				}
+			}
+
 		forwardIntentActionIfPresent(intent)
+	}
+
+	private fun backupRelativePath(): String {
+		return "${Environment.DIRECTORY_DOWNLOADS}/$BACKUP_FOLDER_NAME/"
+	}
+
+	private fun legacyBackupFile(): File {
+		return File(
+			File(
+				Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS),
+				BACKUP_FOLDER_NAME,
+			),
+			BACKUP_FILE_NAME,
+		)
+	}
+
+	private fun findBackupUri(): Uri? {
+		if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return null
+		val projection = arrayOf(MediaStore.MediaColumns._ID)
+		val selection =
+			"${MediaStore.MediaColumns.DISPLAY_NAME}=? AND ${MediaStore.MediaColumns.RELATIVE_PATH}=?"
+		val args = arrayOf(BACKUP_FILE_NAME, backupRelativePath())
+
+		contentResolver.query(
+			MediaStore.Downloads.EXTERNAL_CONTENT_URI,
+			projection,
+			selection,
+			args,
+			null,
+		)?.use { cursor ->
+			if (cursor.moveToFirst()) {
+				val id = cursor.getLong(cursor.getColumnIndexOrThrow(MediaStore.MediaColumns._ID))
+				return ContentUris.withAppendedId(MediaStore.Downloads.EXTERNAL_CONTENT_URI, id)
+			}
+		}
+		return null
+	}
+
+	private fun writeScheduleBackup(content: String): Boolean {
+		return try {
+			if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+				var isNewFile = false
+				val uri = findBackupUri() ?: run {
+					isNewFile = true
+					val values = ContentValues().apply {
+						put(MediaStore.MediaColumns.DISPLAY_NAME, BACKUP_FILE_NAME)
+						put(MediaStore.MediaColumns.MIME_TYPE, "application/json")
+						put(MediaStore.MediaColumns.RELATIVE_PATH, backupRelativePath())
+						put(MediaStore.MediaColumns.IS_PENDING, 1)
+					}
+					contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
+				} ?: return false
+
+				contentResolver.openOutputStream(uri, "wt")?.bufferedWriter(Charsets.UTF_8)
+					?.use { writer ->
+						writer.write(content)
+					} ?: return false
+
+				if (isNewFile) {
+					val values = ContentValues().apply {
+						put(MediaStore.MediaColumns.IS_PENDING, 0)
+					}
+					contentResolver.update(uri, values, null, null)
+				}
+				true
+			} else {
+				val file = legacyBackupFile()
+				file.parentFile?.mkdirs()
+				file.writeText(content, Charsets.UTF_8)
+				true
+			}
+		} catch (_: Throwable) {
+			false
+		}
+	}
+
+	private fun readScheduleBackup(): String? {
+		return try {
+			if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+				val uri = findBackupUri() ?: return null
+				contentResolver.openInputStream(uri)?.bufferedReader(Charsets.UTF_8)
+					?.use { reader ->
+						reader.readText()
+					}
+			} else {
+				val file = legacyBackupFile()
+				if (file.exists()) file.readText(Charsets.UTF_8) else null
+			}
+		} catch (_: Throwable) {
+			null
+		}
 	}
 
 	override fun onNewIntent(intent: Intent) {
