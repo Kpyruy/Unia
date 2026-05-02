@@ -2115,24 +2115,16 @@ class _ExamsPageState extends State<ExamsPage> {
 
   Future<void> _loadCustomExams() async {
     final prefs = await SharedPreferences.getInstance();
-    final raw = prefs.getStringList('customExams') ?? [];
-    _customExams = raw
-        .map((e) {
-          try {
-            return Map<String, dynamic>.from(jsonDecode(e) as Map);
-          } catch (_) {
-            return <String, dynamic>{};
-          }
-        })
-        .where((e) => e.isNotEmpty)
-        .toList();
+    _customExams = ScheduleBackupService.loadCustomExams(prefs);
   }
 
   Future<void> _saveCustomExams() async {
     final prefs = await SharedPreferences.getInstance();
-    await prefs.setStringList(
-      'customExams',
-      _customExams.map((e) => jsonEncode(e)).toList(),
+    await ScheduleBackupService.saveCustomExams(prefs, _customExams);
+    await ScheduleBackupService.writeCurrentState(
+      prefs,
+      customExams: _customExams,
+      preserveExistingExamsWhenEmpty: false,
     );
   }
 
@@ -3398,17 +3390,7 @@ class _TimetableChatSheetState extends State<_TimetableChatSheet> {
 
   Future<void> _loadExams() async {
     final prefs = await SharedPreferences.getInstance();
-    final raw = prefs.getStringList('customExams') ?? [];
-    final customExams = raw
-        .map((e) {
-          try {
-            return jsonDecode(e) as Map<String, dynamic>;
-          } catch (_) {
-            return <String, dynamic>{};
-          }
-        })
-        .where((e) => e.isNotEmpty)
-        .toList();
+    final customExams = ScheduleBackupService.loadCustomExams(prefs);
 
     if (mounted) {
       setState(() {
@@ -5862,6 +5844,146 @@ class _SettingsPageState extends State<SettingsPage> {
     }
   }
 
+  Future<void> _syncRuntimeStateFromPrefs(SharedPreferences prefs) async {
+    final locale = prefs.getString('appLocale') ?? 'en';
+    appLocaleNotifier.value = AppL10n.supportedLocales.contains(locale)
+        ? locale
+        : 'en';
+    themeModeNotifier.value =
+        ThemeMode.values[(prefs.getInt('themeMode') ?? 0).clamp(0, 2)];
+    showCancelledNotifier.value = prefs.getBool('showCancelled') ?? true;
+    backgroundAnimationsNotifier.value =
+        prefs.getBool('backgroundAnimations') ?? true;
+    backgroundAnimationStyleNotifier.value =
+        (prefs.getInt('backgroundAnimationStyle') ?? 0).clamp(0, 9);
+    backgroundGyroscopeNotifier.value =
+        prefs.getBool('backgroundGyroscope') ?? false;
+    blurEnabledNotifier.value = prefs.getBool('blurEnabled') ?? true;
+    progressivePushNotifier.value = prefs.getBool('progressivePush') ?? true;
+    dailyBriefingPushNotifier.value =
+        prefs.getBool('dailyBriefingPush') ?? true;
+    importantChangesPushNotifier.value =
+        prefs.getBool('importantChangesPush') ?? true;
+    manualModeNotifier.value = prefs.getBool('manualMode') ?? true;
+    profileName = prefs.getString('profileName') ?? 'Unia';
+    personType =
+        prefs.getInt('personType') ?? ManualScheduleService.manualPersonType;
+    personId = prefs.getInt('personId') ?? ManualScheduleService.manualPersonId;
+    final definitions = await ManualScheduleService.loadDefinitions(prefs);
+    knownSubjectsNotifier.value = definitions
+        .map((lesson) => lesson.subject.trim().isNotEmpty
+            ? lesson.subject.trim()
+            : lesson.subjectShort.trim())
+        .where((subject) => subject.isNotEmpty)
+        .toSet();
+    await _loadPrefs();
+  }
+
+  Future<void> _exportStudyData() async {
+    final l = AppL10n.of(appLocaleNotifier.value);
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final raw = await ScheduleBackupService.exportCurrentStateJson(prefs);
+      final fileName =
+          'unia-study-data-${DateFormat('yyyyMMdd-HHmm').format(DateTime.now())}.json';
+      final savedPath = await FilePicker.saveFile(
+        dialogTitle: l.settingsExportStudyData,
+        fileName: fileName,
+        type: FileType.custom,
+        allowedExtensions: const ['json'],
+        bytes: Uint8List.fromList(utf8.encode(raw)),
+      );
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            savedPath == null
+                ? l.settingsExportCancelled
+                : l.settingsExportSuccess,
+          ),
+          behavior: SnackBarBehavior.floating,
+        ),
+      );
+    } catch (_) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(l.settingsExportFailed),
+          behavior: SnackBarBehavior.floating,
+        ),
+      );
+    }
+  }
+
+  Future<void> _importStudyData() async {
+    final l = AppL10n.of(appLocaleNotifier.value);
+    try {
+      final picked = await FilePicker.pickFiles(
+        type: FileType.custom,
+        allowedExtensions: const ['json'],
+        withData: true,
+      );
+      final file = picked?.files.single;
+      if (file == null) {
+        if (!mounted) return;
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(l.settingsImportCancelled),
+            behavior: SnackBarBehavior.floating,
+          ),
+        );
+        return;
+      }
+      final bytes = file.bytes ??
+          (file.path == null ? null : await File(file.path!).readAsBytes());
+      if (bytes == null) {
+        if (!mounted) return;
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(l.settingsImportFailed),
+            behavior: SnackBarBehavior.floating,
+          ),
+        );
+        return;
+      }
+      final prefs = await SharedPreferences.getInstance();
+      final imported = await ScheduleBackupService.importBackupJson(
+        prefs,
+        utf8.decode(bytes),
+      );
+      if (!mounted) return;
+      if (!imported) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(l.settingsImportInvalid),
+            behavior: SnackBarBehavior.floating,
+          ),
+        );
+        return;
+      }
+      await _syncRuntimeStateFromPrefs(prefs);
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(l.settingsImportSuccess),
+          behavior: SnackBarBehavior.floating,
+        ),
+      );
+      Navigator.of(context).pushAndRemoveUntil(
+        MaterialPageRoute(builder: (_) => const MainNavigationScreen()),
+        (route) => false,
+      );
+    } catch (_) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(l.settingsImportFailed),
+          behavior: SnackBarBehavior.floating,
+        ),
+      );
+    }
+  }
+
   String _maskKey(String key) {
     if (key.isEmpty) return '';
     return key.length > 8
@@ -7576,6 +7698,54 @@ class _SettingsPageState extends State<SettingsPage> {
                     offsetY: 24,
                     startScale: 0.97,
                     child: _section(
+                      l.settingsSectionData,
+                      Icons.import_export_rounded,
+                      [
+                        _tile(
+                          leading: _tileIcon(
+                            Icons.ios_share_rounded,
+                            cs.primary,
+                          ),
+                          title: l.settingsExportStudyData,
+                          subtitle: l.settingsExportStudyDataDesc,
+                          trailing: Icon(
+                            Icons.chevron_right_rounded,
+                            size: 20,
+                            color: cs.onSurface.withValues(alpha: 0.4),
+                          ),
+                          onTap: () {
+                            HapticFeedback.selectionClick();
+                            _exportStudyData();
+                          },
+                        ),
+                        _tile(
+                          leading: _tileIcon(
+                            Icons.upload_file_rounded,
+                            cs.tertiary,
+                          ),
+                          title: l.settingsImportStudyData,
+                          subtitle: l.settingsImportStudyDataDesc,
+                          trailing: Icon(
+                            Icons.chevron_right_rounded,
+                            size: 20,
+                            color: cs.onSurface.withValues(alpha: 0.4),
+                          ),
+                          onTap: () {
+                            HapticFeedback.selectionClick();
+                            _importStudyData();
+                          },
+                        ),
+                      ],
+                      cs,
+                      accent: cs.tertiary,
+                    ),
+                  ),
+
+                  _springEntry(
+                    duration: const Duration(milliseconds: 580),
+                    offsetY: 24,
+                    startScale: 0.97,
+                    child: _section(
                       l.settingsSectionAI,
                       Icons.smart_toy_rounded,
                       [
@@ -7696,7 +7866,7 @@ class _SettingsPageState extends State<SettingsPage> {
 
                   // ── Subjects & Colors (merged) ───────────────────────────
                   _springEntry(
-                    duration: const Duration(milliseconds: 580),
+                    duration: const Duration(milliseconds: 630),
                     offsetY: 26,
                     startScale: 0.97,
                     child: _section(
@@ -7751,7 +7921,7 @@ class _SettingsPageState extends State<SettingsPage> {
                   ),
 
                   _springEntry(
-                    duration: const Duration(milliseconds: 630),
+                    duration: const Duration(milliseconds: 680),
                     offsetY: 28,
                     startScale: 0.97,
                     child: _section(
@@ -7815,7 +7985,7 @@ class _SettingsPageState extends State<SettingsPage> {
 
                   // ── About ────────────────────────────────────────────────
                   _springEntry(
-                    duration: const Duration(milliseconds: 680),
+                    duration: const Duration(milliseconds: 730),
                     offsetY: 30,
                     startScale: 0.97,
                     child: _section(

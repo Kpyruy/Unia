@@ -54,7 +54,9 @@ class ManualScheduleService {
     final decoded = jsonDecode(raw);
     if (decoded is! Map) return const [];
     final schemaVersion = (decoded['schemaVersion'] as num?)?.toInt();
-    if (schemaVersion != backupSchemaVersion && schemaVersion != 2) {
+    if (schemaVersion != backupSchemaVersion &&
+        schemaVersion != 2 &&
+        schemaVersion != 3) {
       return const [];
     }
     final lessons = decoded['manualLessons'];

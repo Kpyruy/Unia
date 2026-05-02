@@ -247,6 +247,18 @@ class AppL10n {
   String get settingsThemeSystem => _t('settingsThemeSystem');
   String get settingsThemeDark => _t('settingsThemeDark');
   String get settingsSectionTimetable => _t('settingsSectionTimetable');
+  String get settingsSectionData => _t('settingsSectionData');
+  String get settingsExportStudyData => _t('settingsExportStudyData');
+  String get settingsExportStudyDataDesc => _t('settingsExportStudyDataDesc');
+  String get settingsImportStudyData => _t('settingsImportStudyData');
+  String get settingsImportStudyDataDesc => _t('settingsImportStudyDataDesc');
+  String get settingsExportSuccess => _t('settingsExportSuccess');
+  String get settingsExportCancelled => _t('settingsExportCancelled');
+  String get settingsExportFailed => _t('settingsExportFailed');
+  String get settingsImportSuccess => _t('settingsImportSuccess');
+  String get settingsImportCancelled => _t('settingsImportCancelled');
+  String get settingsImportInvalid => _t('settingsImportInvalid');
+  String get settingsImportFailed => _t('settingsImportFailed');
   String get settingsShowCancelled => _t('settingsShowCancelled');
   String get settingsShowCancelledDesc => _t('settingsShowCancelledDesc');
   String get settingsBackgroundAnimations => _t('settingsBackgroundAnimations');
@@ -549,6 +561,20 @@ class AppL10n {
       'settingsThemeSystem': 'System',
       'settingsThemeDark': 'Dark',
       'settingsSectionTimetable': 'Timetable',
+      'settingsSectionData': 'Import / Export',
+      'settingsExportStudyData': 'Export study data',
+      'settingsExportStudyDataDesc':
+          'Save timetable, exams, tasks, and setup settings as one JSON file',
+      'settingsImportStudyData': 'Import study data',
+      'settingsImportStudyDataDesc':
+          'Restore timetable, exams, tasks, and setup settings from a JSON file',
+      'settingsExportSuccess': 'Study data exported.',
+      'settingsExportCancelled': 'Export cancelled.',
+      'settingsExportFailed': 'Export failed. Please try again.',
+      'settingsImportSuccess': 'Study data imported.',
+      'settingsImportCancelled': 'Import cancelled.',
+      'settingsImportInvalid': 'Selected file is not a valid Unia backup.',
+      'settingsImportFailed': 'Import failed. Please try again.',
       'settingsShowCancelled': 'Show cancelled lessons',
       'settingsShowCancelledDesc':
           'Cancelled lessons are shown in the timetable',
@@ -815,6 +841,20 @@ class AppL10n {
       'settingsThemeSystem': 'Systém',
       'settingsThemeDark': 'Tmavá',
       'settingsSectionTimetable': 'Rozvrh',
+      'settingsSectionData': 'Import / Export',
+      'settingsExportStudyData': 'Exportovať študijné dáta',
+      'settingsExportStudyDataDesc':
+          'Uloží rozvrh, skúšky, úlohy a nastavenia do jedného JSON súboru',
+      'settingsImportStudyData': 'Importovať študijné dáta',
+      'settingsImportStudyDataDesc':
+          'Obnoví rozvrh, skúšky, úlohy a nastavenia z JSON súboru',
+      'settingsExportSuccess': 'Študijné dáta boli exportované.',
+      'settingsExportCancelled': 'Export bol zrušený.',
+      'settingsExportFailed': 'Export zlyhal. Skúste to znova.',
+      'settingsImportSuccess': 'Študijné dáta boli importované.',
+      'settingsImportCancelled': 'Import bol zrušený.',
+      'settingsImportInvalid': 'Vybraný súbor nie je platná záloha Unia.',
+      'settingsImportFailed': 'Import zlyhal. Skúste to znova.',
       'settingsShowCancelled': 'Zobraziť zrušené hodiny',
       'settingsShowCancelledDesc': 'Zrušené hodiny sa zobrazia v rozvrhu',
       'settingsBackgroundAnimations': 'Animácie pozadia',

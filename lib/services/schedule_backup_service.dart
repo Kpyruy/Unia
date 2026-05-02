@@ -9,8 +9,9 @@ import 'study_task_service.dart';
 class ScheduleBackupService {
   static const String backupFileName = 'unia_schedule_backup.json';
   static const String backupDirectory = 'Download/Unia';
+  static const String customExamsKey = 'customExams';
   static const MethodChannel _channel = MethodChannel('unia/schedule_backup');
-  static const int backupSchemaVersion = 2;
+  static const int backupSchemaVersion = 3;
 
   static Future<bool> writeDefinitions(
     List<ManualLessonDefinition> definitions,
@@ -20,6 +21,7 @@ class ScheduleBackupService {
       prefs,
       definitions: definitions,
       preserveExistingLessonsWhenEmpty: false,
+      preserveExistingExamsWhenEmpty: false,
     );
   }
 
@@ -27,8 +29,10 @@ class ScheduleBackupService {
     SharedPreferences prefs, {
     List<ManualLessonDefinition>? definitions,
     List<StudyTask>? tasks,
+    List<Map<String, dynamic>>? customExams,
     bool preserveExistingLessonsWhenEmpty = true,
     bool preserveExistingTasksWhenEmpty = true,
+    bool preserveExistingExamsWhenEmpty = true,
   }) async {
     var lessons =
         definitions ?? await ManualScheduleService.loadDefinitions(prefs);
@@ -39,27 +43,53 @@ class ScheduleBackupService {
     if (studyTasks.isEmpty && preserveExistingTasksWhenEmpty) {
       studyTasks = await _readExistingBackupTasks();
     }
-    final content = encodeBackupJson(prefs, lessons, tasks: studyTasks);
+    var exams = customExams ?? loadCustomExams(prefs);
+    if (exams.isEmpty && preserveExistingExamsWhenEmpty) {
+      exams = await _readExistingBackupExams();
+    }
+    final content = encodeBackupJson(
+      prefs,
+      lessons,
+      tasks: studyTasks,
+      customExams: exams,
+    );
     return _writeBackupJson(content);
+  }
+
+  static Future<String> exportCurrentStateJson(
+    SharedPreferences prefs, {
+    List<ManualLessonDefinition>? definitions,
+    List<StudyTask>? tasks,
+    List<Map<String, dynamic>>? customExams,
+  }) async {
+    return encodeBackupJson(
+      prefs,
+      definitions ?? await ManualScheduleService.loadDefinitions(prefs),
+      tasks: tasks ?? await StudyTaskService.loadTasks(prefs),
+      customExams: customExams ?? loadCustomExams(prefs),
+    );
   }
 
   static String encodeBackupJson(
     SharedPreferences prefs,
     List<ManualLessonDefinition> definitions, {
     List<StudyTask> tasks = const [],
+    List<Map<String, dynamic>> customExams = const [],
   }) {
     final normalized = [...definitions]
       ..sort((a, b) {
         final byDay = a.dayIndex.compareTo(b.dayIndex);
         if (byDay != 0) return byDay;
         return a.startTime.compareTo(b.startTime);
-      });
+    });
     final normalizedTasks = [...tasks]..sort(StudyTaskService.compareTasks);
+    final normalizedExams = _normalizeCustomExams(customExams);
     return jsonEncode({
       'app': 'Unia',
       'schemaVersion': backupSchemaVersion,
       'manualLessons': normalized.map((lesson) => lesson.toJson()).toList(),
       'studyTasks': normalizedTasks.map((task) => task.toJson()).toList(),
+      'customExams': normalizedExams,
       'startup': _startupSettingsFromPrefs(prefs),
     });
   }
@@ -86,11 +116,25 @@ class ScheduleBackupService {
     final raw = await readBackupJson();
     if (raw == null || raw.trim().isEmpty) return false;
 
+    final restored = await importBackupJson(
+      prefs,
+      raw,
+      writePersistentBackup: false,
+    );
+    return restored;
+  }
+
+  static Future<bool> importBackupJson(
+    SharedPreferences prefs,
+    String raw, {
+    bool writePersistentBackup = true,
+  }) async {
     final payload = _decodeBackupJson(raw);
     if (!payload.hasRestorableData) return false;
 
     await ManualScheduleService.saveDefinitions(prefs, payload.definitions);
     await StudyTaskService.saveTasks(prefs, payload.tasks);
+    await saveCustomExams(prefs, payload.customExams);
     await _restoreStartupSettings(prefs, payload.startup);
     await prefs.setBool('onboardingCompleted', true);
     await prefs.setBool('tutorialCompleted', true);
@@ -103,6 +147,17 @@ class ScheduleBackupService {
     );
     await prefs.setInt('personType', ManualScheduleService.manualPersonType);
     await prefs.setInt('personId', ManualScheduleService.manualPersonId);
+    if (writePersistentBackup) {
+      await writeCurrentState(
+        prefs,
+        definitions: payload.definitions,
+        tasks: payload.tasks,
+        customExams: payload.customExams,
+        preserveExistingLessonsWhenEmpty: false,
+        preserveExistingTasksWhenEmpty: false,
+        preserveExistingExamsWhenEmpty: false,
+      );
+    }
     return true;
   }
 
@@ -123,18 +178,21 @@ class ScheduleBackupService {
       final map = Map<String, dynamic>.from(decoded);
       final schemaVersion = (map['schemaVersion'] as num?)?.toInt();
       if (schemaVersion != ManualScheduleService.backupSchemaVersion &&
+          schemaVersion != 2 &&
           schemaVersion != backupSchemaVersion) {
         return const _ScheduleBackupPayload.empty();
       }
 
       final definitions = ManualScheduleService.decodeBackupJson(raw);
       final tasks = _decodeStudyTasks(map['studyTasks']);
+      final exams = _decodeCustomExams(map['customExams']);
       final startup = map['startup'] is Map
           ? Map<String, dynamic>.from(map['startup'] as Map)
           : const <String, dynamic>{};
       return _ScheduleBackupPayload(
         definitions: definitions,
         tasks: tasks,
+        customExams: exams,
         startup: startup,
         hasStartup: startup.isNotEmpty,
       );
@@ -156,6 +214,12 @@ class ScheduleBackupService {
     return _decodeBackupJson(raw).tasks;
   }
 
+  static Future<List<Map<String, dynamic>>> _readExistingBackupExams() async {
+    final raw = await readBackupJson();
+    if (raw == null || raw.trim().isEmpty) return const [];
+    return _decodeBackupJson(raw).customExams;
+  }
+
   static List<StudyTask> _decodeStudyTasks(dynamic rawTasks) {
     if (rawTasks is! List) return const [];
     final tasks = rawTasks
@@ -167,6 +231,76 @@ class ScheduleBackupService {
         .toList();
     tasks.sort(StudyTaskService.compareTasks);
     return tasks;
+  }
+
+  static List<Map<String, dynamic>> loadCustomExams(SharedPreferences prefs) {
+    final raw = prefs.getStringList(customExamsKey) ?? const [];
+    return raw
+        .map((entry) {
+          try {
+            final decoded = jsonDecode(entry);
+            if (decoded is! Map) return null;
+            return Map<String, dynamic>.from(decoded);
+          } catch (_) {
+            return null;
+          }
+        })
+        .whereType<Map<String, dynamic>>()
+        .toList();
+  }
+
+  static Future<void> saveCustomExams(
+    SharedPreferences prefs,
+    List<Map<String, dynamic>> exams,
+  ) async {
+    final normalized = _normalizeCustomExams(exams);
+    await prefs.setStringList(
+      customExamsKey,
+      normalized.map((exam) => jsonEncode(exam)).toList(),
+    );
+  }
+
+  static List<Map<String, dynamic>> _decodeCustomExams(dynamic rawExams) {
+    if (rawExams is! List) return const [];
+    return _normalizeCustomExams(
+      rawExams
+          .whereType<Map>()
+          .map((entry) => Map<String, dynamic>.from(entry))
+          .toList(),
+    );
+  }
+
+  static List<Map<String, dynamic>> _normalizeCustomExams(
+    List<Map<String, dynamic>> exams,
+  ) {
+    final normalized = exams
+        .map((exam) {
+          final subject = (exam['subject'] ?? exam['title'] ?? '')
+              .toString()
+              .trim();
+          final rawDate = exam['date'] ?? exam['examDate'] ?? exam['startDate'];
+          final date = rawDate?.toString().replaceAll('-', '').trim();
+          if (subject.isEmpty || date == null || date.length != 8) {
+            return null;
+          }
+          return <String, dynamic>{
+            'subject': subject,
+            'examType': (exam['examType'] ?? exam['type'] ?? 'Exam')
+                .toString()
+                .trim(),
+            'date': rawDate is num ? rawDate.toInt() : date,
+            'description': (exam['description'] ?? '').toString().trim(),
+            '_custom': true,
+          };
+        })
+        .whereType<Map<String, dynamic>>()
+        .toList();
+    normalized.sort((a, b) {
+      final byDate = a['date'].toString().compareTo(b['date'].toString());
+      if (byDate != 0) return byDate;
+      return (a['subject'] as String).compareTo(b['subject'] as String);
+    });
+    return normalized;
   }
 
   static Map<String, dynamic> _startupSettingsFromPrefs(
@@ -317,6 +451,7 @@ class _ScheduleBackupPayload {
   const _ScheduleBackupPayload({
     required this.definitions,
     required this.tasks,
+    required this.customExams,
     required this.startup,
     required this.hasStartup,
   });
@@ -324,14 +459,19 @@ class _ScheduleBackupPayload {
   const _ScheduleBackupPayload.empty()
     : definitions = const [],
       tasks = const [],
+      customExams = const [],
       startup = const {},
       hasStartup = false;
 
   final List<ManualLessonDefinition> definitions;
   final List<StudyTask> tasks;
+  final List<Map<String, dynamic>> customExams;
   final Map<String, dynamic> startup;
   final bool hasStartup;
 
   bool get hasRestorableData =>
-      definitions.isNotEmpty || tasks.isNotEmpty || hasStartup;
+      definitions.isNotEmpty ||
+      tasks.isNotEmpty ||
+      customExams.isNotEmpty ||
+      hasStartup;
 }

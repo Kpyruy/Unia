@@ -112,7 +112,7 @@ void main() {
       expect(saved, isTrue);
       expect(captured, isNotNull);
       final decoded = jsonDecode(captured!) as Map<String, dynamic>;
-      expect(decoded['schemaVersion'], 2);
+      expect(decoded['schemaVersion'], 3);
       expect(decoded['startup'], containsPair('appLocale', 'sk'));
       expect(decoded['startup'], containsPair('themeMode', 2));
       expect(ManualScheduleService.decodeBackupJson(captured!), [lesson]);
@@ -210,5 +210,115 @@ void main() {
     expect(saved, isTrue);
     final decoded = jsonDecode(captured!) as Map<String, dynamic>;
     expect(decoded['studyTasks'], [task.toJson()]);
+  });
+
+  test('writeCurrentState includes custom exams in backup content', () async {
+    final exam = {
+      'subject': 'Physics',
+      'examType': 'Final',
+      'date': 20260602,
+      'description': 'Chapters 1-5',
+      '_custom': true,
+    };
+    SharedPreferences.setMockInitialValues({
+      ScheduleBackupService.customExamsKey: [jsonEncode(exam)],
+    });
+    final prefs = await SharedPreferences.getInstance();
+    String? captured;
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(channel, (call) async {
+          if (call.method == 'readScheduleBackup') return null;
+          expect(call.method, 'writeScheduleBackup');
+          captured = (call.arguments as Map)['content'] as String;
+          return true;
+        });
+
+    final saved = await ScheduleBackupService.writeCurrentState(prefs);
+
+    expect(saved, isTrue);
+    final decoded = jsonDecode(captured!) as Map<String, dynamic>;
+    expect(decoded['customExams'], [exam]);
+  });
+
+  test('importBackupJson imports lessons, tasks, exams, and startup settings', () async {
+    SharedPreferences.setMockInitialValues({});
+    final prefs = await SharedPreferences.getInstance();
+    const lesson = ManualLessonDefinition(
+      id: 'security',
+      dayIndex: 4,
+      startTime: 1330,
+      endTime: 1500,
+      subject: 'Security',
+      subjectShort: 'SEC',
+      teacher: 'Ada Lovelace',
+      room: 'S404',
+    );
+    const task = StudyTask(
+      id: 'task-security',
+      title: 'Prepare slides',
+      subject: 'Security',
+      dueDate: 20260601,
+      notes: 'Include examples',
+      priority: StudyTaskPriority.high,
+      status: StudyTaskStatus.inProgress,
+    );
+    final exam = {
+      'subject': 'Security',
+      'examType': 'Oral exam',
+      'date': '20260612',
+      'description': 'All lectures',
+      '_custom': true,
+    };
+    final raw = ScheduleBackupService.encodeBackupJson(
+      prefs,
+      const [lesson],
+      tasks: const [task],
+      customExams: [exam],
+    );
+
+    final imported = await ScheduleBackupService.importBackupJson(prefs, raw);
+
+    expect(imported, isTrue);
+    expect(await ManualScheduleService.loadDefinitions(prefs), [lesson]);
+    expect(await StudyTaskService.loadTasks(prefs), [task]);
+    expect(prefs.getStringList(ScheduleBackupService.customExamsKey), [
+      jsonEncode(exam),
+    ]);
+    expect(prefs.getBool('manualMode'), isTrue);
+    expect(prefs.getBool('onboardingCompleted'), isTrue);
+  });
+
+  test('exportCurrentStateJson returns full study data payload', () async {
+    const lesson = ManualLessonDefinition(
+      id: 'math',
+      dayIndex: 0,
+      startTime: 800,
+      endTime: 930,
+      subject: 'Math',
+      subjectShort: 'M',
+      teacher: '',
+      room: 'M1',
+    );
+    final exam = {
+      'subject': 'Math',
+      'examType': 'Quiz',
+      'date': 20260520,
+      'description': '',
+      '_custom': true,
+    };
+    SharedPreferences.setMockInitialValues({
+      ManualScheduleService.storageKey: [jsonEncode(lesson.toJson())],
+      ScheduleBackupService.customExamsKey: [jsonEncode(exam)],
+      'appLocale': 'en',
+    });
+    final prefs = await SharedPreferences.getInstance();
+
+    final raw = await ScheduleBackupService.exportCurrentStateJson(prefs);
+
+    final decoded = jsonDecode(raw) as Map<String, dynamic>;
+    expect(decoded['schemaVersion'], 3);
+    expect(decoded['manualLessons'], [lesson.toJson()]);
+    expect(decoded['customExams'], [exam]);
+    expect(decoded['startup'], containsPair('appLocale', 'en'));
   });
 }
