@@ -1,6 +1,7 @@
 import 'dart:ui';
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
 import 'dart:math' as math;
 import 'package:dynamic_color/dynamic_color.dart';
 import 'package:flutter/material.dart';
@@ -20,8 +21,10 @@ import 'l10n.dart';
 import 'core/time_utils.dart';
 import 'services/notification_service.dart';
 import 'services/background_service.dart';
+import 'services/lesson_status_service.dart';
 import 'services/manual_schedule_service.dart';
 import 'services/schedule_backup_service.dart';
+import 'services/study_task_service.dart';
 import 'widgets/rounded_blur_app_bar.dart';
 
 part 'app/unia_app.dart';
@@ -56,10 +59,6 @@ void main() async {
     profileName = prefs.getString('profileName') ?? "";
     personType = prefs.getInt('personType') ?? 0;
     personId = prefs.getInt('personId') ?? 0;
-    final definitions = await ManualScheduleService.loadDefinitions(prefs);
-    if (definitions.isNotEmpty) {
-      unawaited(ScheduleBackupService.writeDefinitions(definitions));
-    }
   }
   final savedLocale = prefs.getString('appLocale') ?? 'en';
   appLocaleNotifier.value = AppL10n.supportedLocales.contains(savedLocale)
@@ -128,6 +127,9 @@ void main() async {
       customCompatibility: aiCustomCompatibility,
     );
     await prefs.setString('aiModel', aiModel);
+  }
+  if (manualModeNotifier.value) {
+    unawaited(ScheduleBackupService.writeCurrentState(prefs));
   }
 
   runApp(
@@ -388,7 +390,10 @@ class _WeeklyTimetablePageState extends State<WeeklyTimetablePage>
   ) async {
     final prefs = await SharedPreferences.getInstance();
     await ManualScheduleService.saveDefinitions(prefs, definitions);
-    await ScheduleBackupService.writeDefinitions(definitions);
+    await ScheduleBackupService.writeCurrentState(
+      prefs,
+      definitions: definitions,
+    );
     _manualLessons = definitions;
     await _fetchFullWeek(silent: true);
   }
@@ -407,6 +412,8 @@ class _WeeklyTimetablePageState extends State<WeeklyTimetablePage>
         .toInt();
     var startTime = existing?.startTime ?? 800;
     var endTime = existing?.endTime ?? 845;
+    var selectedRecurrence =
+        existing?.recurrence ?? ManualLessonRecurrence.everyWeek;
 
     await showModalBottomSheet<void>(
       context: context,
@@ -509,6 +516,33 @@ class _WeeklyTimetablePageState extends State<WeeklyTimetablePage>
                         ),
                         onChanged: (value) {
                           if (value != null) setDlg(() => selectedDay = value);
+                        },
+                      ),
+                      const SizedBox(height: 12),
+                      DropdownButtonFormField<ManualLessonRecurrence>(
+                        initialValue: selectedRecurrence,
+                        decoration: decoration(
+                          'Week pattern',
+                          Icons.repeat_rounded,
+                        ),
+                        items: const [
+                          DropdownMenuItem(
+                            value: ManualLessonRecurrence.everyWeek,
+                            child: Text('Every week'),
+                          ),
+                          DropdownMenuItem(
+                            value: ManualLessonRecurrence.oddWeeks,
+                            child: Text('Odd weeks only'),
+                          ),
+                          DropdownMenuItem(
+                            value: ManualLessonRecurrence.evenWeeks,
+                            child: Text('Even weeks only'),
+                          ),
+                        ],
+                        onChanged: (value) {
+                          if (value != null) {
+                            setDlg(() => selectedRecurrence = value);
+                          }
                         },
                       ),
                       const SizedBox(height: 12),
@@ -621,6 +655,7 @@ class _WeeklyTimetablePageState extends State<WeeklyTimetablePage>
                                 subjectShort: short,
                                 teacher: teacherCtrl.text.trim(),
                                 room: roomCtrl.text.trim(),
+                                recurrence: selectedRecurrence,
                               );
                               final next = [
                                 ..._manualLessons.where(
@@ -722,6 +757,52 @@ class _WeeklyTimetablePageState extends State<WeeklyTimetablePage>
     }
 
     return merged;
+  }
+
+  Map<int, List<dynamic>> _applyLessonStatusOverrides(
+    Map<int, List<dynamic>> weekData,
+    Map<String, LessonOccurrenceStatus> statuses,
+  ) {
+    if (statuses.isEmpty) return weekData;
+    return weekData.map((dayIndex, lessons) {
+      return MapEntry(
+        dayIndex,
+        lessons.map((lesson) {
+          if (lesson is! Map) return lesson;
+          final map = Map<dynamic, dynamic>.from(lesson);
+          final key = LessonStatusService.buildKey(map);
+          final status = statuses[key];
+          if (status == null) return map;
+          map['_userStatus'] = status.storageValue;
+          if (status == LessonOccurrenceStatus.cancelled) {
+            map['code'] = 'cancelled';
+          }
+          return map;
+        }).toList(),
+      );
+    });
+  }
+
+  Future<void> _setLessonStatus(
+    Map<dynamic, dynamic> lesson,
+    LessonOccurrenceStatus status,
+  ) async {
+    final prefs = await SharedPreferences.getInstance();
+    await LessonStatusService.setStatus(
+      prefs,
+      LessonStatusService.buildKey(lesson),
+      status,
+    );
+    await _fetchFullWeek(silent: true);
+  }
+
+  Future<void> _clearLessonStatus(Map<dynamic, dynamic> lesson) async {
+    final prefs = await SharedPreferences.getInstance();
+    await LessonStatusService.clearStatus(
+      prefs,
+      LessonStatusService.buildKey(lesson),
+    );
+    await _fetchFullWeek(silent: true);
   }
 
   List<_TimeRangeLabel> _collectTimeRangesFromWeek() {
@@ -1047,6 +1128,7 @@ class _WeeklyTimetablePageState extends State<WeeklyTimetablePage>
                           );
                           final dim = isToday && endMin <= nowMin;
                           final isCancelled = (l['code'] ?? '') == 'cancelled';
+                          final isMissed = l['_userStatus'] == 'missed';
                           final subject =
                               l['_subjectShort']?.toString().isNotEmpty == true
                               ? l['_subjectShort'].toString()
@@ -1074,17 +1156,21 @@ class _WeeklyTimetablePageState extends State<WeeklyTimetablePage>
 
                           final cs = Theme.of(context).colorScheme;
                           final sk = l['_subjectShort']?.toString() ?? '';
-                          final cv = isCancelled
+                          final cv = (isCancelled || isMissed)
                               ? null
                               : subjectColorsNotifier.value[sk];
                           final isDark =
                               Theme.of(context).brightness == Brightness.dark;
                           final fgColor = isCancelled
+                              ? cs.onSurfaceVariant
+                              : isMissed
                               ? cs.error
                               : cv != null
                               ? Color(cv)
                               : _autoLessonColor(sk, isDark);
                           final bgColor = isCancelled
+                              ? cs.surfaceContainerHighest
+                              : isMissed
                               ? cs.errorContainer
                               : fgColor.withValues(alpha: isDark ? 0.28 : 0.20);
 
@@ -1098,12 +1184,24 @@ class _WeeklyTimetablePageState extends State<WeeklyTimetablePage>
                               child: GestureDetector(
                                 onTap: () {
                                   final manual = _manualDefinitionForLesson(l);
-                                  if (manualModeNotifier.value &&
-                                      manual != null) {
-                                    _openManualLessonSheet(existing: manual);
-                                    return;
-                                  }
-                                  _showLessonDetail(context, l);
+                                  _showLessonDetail(
+                                    context,
+                                    l,
+                                    onMarkMissed: () => _setLessonStatus(
+                                      l,
+                                      LessonOccurrenceStatus.missed,
+                                    ),
+                                    onMarkCancelled: () => _setLessonStatus(
+                                      l,
+                                      LessonOccurrenceStatus.cancelled,
+                                    ),
+                                    onClearStatus: () => _clearLessonStatus(l),
+                                    onEditManual: manual == null
+                                        ? null
+                                        : () => _openManualLessonSheet(
+                                            existing: manual,
+                                          ),
+                                  );
                                 },
                                 child: Container(
                                   decoration: BoxDecoration(
@@ -1135,7 +1233,7 @@ class _WeeklyTimetablePageState extends State<WeeklyTimetablePage>
                                           fontSize: 12,
                                           fontWeight: FontWeight.w800,
                                           color: fgColor,
-                                          decoration: isCancelled
+                                          decoration: isCancelled || isMissed
                                               ? TextDecoration.lineThrough
                                               : null,
                                           decorationColor: fgColor,
@@ -1153,6 +1251,17 @@ class _WeeklyTimetablePageState extends State<WeeklyTimetablePage>
                                             color: fgColor.withValues(
                                               alpha: 0.6,
                                             ),
+                                          ),
+                                        ),
+                                      if (isMissed && height >= 46)
+                                        Text(
+                                          'Missed',
+                                          maxLines: 1,
+                                          overflow: TextOverflow.ellipsis,
+                                          style: GoogleFonts.outfit(
+                                            fontSize: 10,
+                                            fontWeight: FontWeight.w800,
+                                            color: fgColor,
                                           ),
                                         ),
                                       if (height >= 52 && room.isNotEmpty)
@@ -1475,6 +1584,8 @@ class _WeeklyTimetablePageState extends State<WeeklyTimetablePage>
                                         endMin <= nowMin;
                                     final isCancelled =
                                         (l['code'] ?? '') == 'cancelled';
+                                    final isMissed =
+                                        l['_userStatus'] == 'missed';
                                     final subject =
                                         l['_subjectShort']
                                                 ?.toString()
@@ -1509,18 +1620,22 @@ class _WeeklyTimetablePageState extends State<WeeklyTimetablePage>
 
                                     final sk2 =
                                         l['_subjectShort']?.toString() ?? '';
-                                    final cv2 = isCancelled
+                                    final cv2 = (isCancelled || isMissed)
                                         ? null
                                         : subjectColorsNotifier.value[sk2];
                                     final isDark2 =
                                         Theme.of(context).brightness ==
                                         Brightness.dark;
                                     final fgColor = isCancelled
+                                        ? cs.onSurfaceVariant
+                                        : isMissed
                                         ? cs.error
                                         : cv2 != null
                                         ? Color(cv2)
                                         : _autoLessonColor(sk2, isDark2);
                                     final bgColor = isCancelled
+                                        ? cs.surfaceContainerHighest
+                                        : isMissed
                                         ? cs.errorContainer
                                         : fgColor.withValues(
                                             alpha: isDark2 ? 0.28 : 0.20,
@@ -1536,14 +1651,30 @@ class _WeeklyTimetablePageState extends State<WeeklyTimetablePage>
                                           onTap: () {
                                             final manual =
                                                 _manualDefinitionForLesson(l);
-                                            if (manualModeNotifier.value &&
-                                                manual != null) {
-                                              _openManualLessonSheet(
-                                                existing: manual,
-                                              );
-                                              return;
-                                            }
-                                            _showLessonDetail(context, l);
+                                            _showLessonDetail(
+                                              context,
+                                              l,
+                                              onMarkMissed: () =>
+                                                  _setLessonStatus(
+                                                    l,
+                                                    LessonOccurrenceStatus
+                                                        .missed,
+                                                  ),
+                                              onMarkCancelled: () =>
+                                                  _setLessonStatus(
+                                                    l,
+                                                    LessonOccurrenceStatus
+                                                        .cancelled,
+                                                  ),
+                                              onClearStatus: () =>
+                                                  _clearLessonStatus(l),
+                                              onEditManual: manual == null
+                                                  ? null
+                                                  : () =>
+                                                        _openManualLessonSheet(
+                                                          existing: manual,
+                                                        ),
+                                            );
                                           },
                                           child: Container(
                                             decoration: BoxDecoration(
@@ -1577,7 +1708,8 @@ class _WeeklyTimetablePageState extends State<WeeklyTimetablePage>
                                                     fontSize: 10,
                                                     fontWeight: FontWeight.w800,
                                                     color: fgColor,
-                                                    decoration: isCancelled
+                                                    decoration:
+                                                        isCancelled || isMissed
                                                         ? TextDecoration
                                                               .lineThrough
                                                         : null,
@@ -1680,15 +1812,20 @@ class _WeeklyTimetablePageState extends State<WeeklyTimetablePage>
 
     final prefs = await SharedPreferences.getInstance();
     final definitions = await ManualScheduleService.loadDefinitions(prefs);
+    final lessonStatuses = await LessonStatusService.loadStatuses(prefs);
     final tempWeek = ManualScheduleService.buildWeek(
       _currentMonday,
       definitions,
     );
+    final weekWithStatuses = _applyLessonStatusOverrides(
+      tempWeek,
+      lessonStatuses,
+    );
     _manualLessons = definitions;
-    _applyKnownSubjectsFromWeek(tempWeek);
+    _applyKnownSubjectsFromWeek(weekWithStatuses);
     if (!mounted) return;
     setState(() {
-      _weekData = tempWeek;
+      _weekData = weekWithStatuses;
       _showingCachedWeek = false;
       _loading = false;
       _loadError = null;
@@ -3122,6 +3259,20 @@ IMPORTANT: The date MUST be a string in YYYYMMDD format. If the year is missing,
 
 // --- KI-ASSISTENT HILFSFUNKTIONEN ---
 
+class _ChatAttachment {
+  final String name;
+  final String mimeType;
+  final List<int> bytes;
+
+  const _ChatAttachment({
+    required this.name,
+    required this.mimeType,
+    required this.bytes,
+  });
+
+  bool get isImage => mimeType.startsWith('image/');
+}
+
 String _formatWeekForAi(Map<int, List<dynamic>> weekData, DateTime monday) {
   final l = AppL10n.of(appLocaleNotifier.value);
   final days = l.weekDayFull;
@@ -3204,6 +3355,7 @@ class _TimetableChatSheetState extends State<_TimetableChatSheet> {
   final _inputController = TextEditingController();
   final _scrollController = ScrollController();
   final List<Map<String, String>> _messages = [];
+  final List<_ChatAttachment> _pendingAttachments = [];
   List<Map<String, dynamic>> _exams = [];
   bool _thinking = false;
 
@@ -3277,6 +3429,86 @@ class _TimetableChatSheetState extends State<_TimetableChatSheet> {
           return da.compareTo(db);
         });
       });
+    }
+  }
+
+  String _mimeTypeForPath(String path) {
+    final lower = path.toLowerCase();
+    if (lower.endsWith('.png')) return 'image/png';
+    if (lower.endsWith('.jpg') || lower.endsWith('.jpeg')) return 'image/jpeg';
+    if (lower.endsWith('.webp')) return 'image/webp';
+    if (lower.endsWith('.pdf')) return 'application/pdf';
+    if (lower.endsWith('.txt')) return 'text/plain';
+    return 'application/octet-stream';
+  }
+
+  Future<void> _addChatPhoto({required ImageSource source}) async {
+    final picked = await ImagePicker().pickImage(
+      source: source,
+      imageQuality: 88,
+      maxWidth: 1800,
+    );
+    if (picked == null) return;
+    final bytes = await picked.readAsBytes();
+    if (!mounted) return;
+    setState(() {
+      _pendingAttachments.add(
+        _ChatAttachment(
+          name: picked.name,
+          mimeType: _mimeTypeForPath(picked.path),
+          bytes: bytes,
+        ),
+      );
+    });
+  }
+
+  Future<void> _addChatFile() async {
+    final picked = await FilePicker.pickFiles(
+      type: FileType.custom,
+      allowedExtensions: ['pdf', 'txt', 'png', 'jpg', 'jpeg', 'webp'],
+      withData: true,
+    );
+    final file = picked?.files.single;
+    if (file == null) return;
+    final bytes = file.bytes ?? await File(file.path!).readAsBytes();
+    if (!mounted) return;
+    setState(() {
+      _pendingAttachments.add(
+        _ChatAttachment(
+          name: file.name,
+          mimeType: _mimeTypeForPath(file.name),
+          bytes: bytes,
+        ),
+      );
+    });
+  }
+
+  Future<void> _openAttachmentPicker() async {
+    final selected = await _showUnifiedOptionSheet<String>(
+      context: context,
+      title: 'Attach',
+      fitContentHeight: true,
+      bottomMargin: 0,
+      options: const [
+        _SheetOption(
+          value: 'camera',
+          title: 'Camera',
+          icon: Icons.photo_camera_rounded,
+        ),
+        _SheetOption(
+          value: 'gallery',
+          title: 'Gallery',
+          icon: Icons.photo_library_rounded,
+        ),
+        _SheetOption(value: 'file', title: 'File', icon: Icons.attach_file),
+      ],
+    );
+    if (selected == 'camera') {
+      await _addChatPhoto(source: ImageSource.camera);
+    } else if (selected == 'gallery') {
+      await _addChatPhoto(source: ImageSource.gallery);
+    } else if (selected == 'file') {
+      await _addChatFile();
     }
   }
 
@@ -3433,15 +3665,25 @@ class _TimetableChatSheetState extends State<_TimetableChatSheet> {
     required String endpoint,
     required String apiKey,
     required String systemPrompt,
+    List<_ChatAttachment> attachments = const [],
   }) async {
     final contents = _messages.map((m) {
       final role = (m['role'] == 'user') ? 'user' : 'model';
-      return {
-        'role': role,
-        'parts': [
-          {'text': m['content'] ?? ''},
-        ],
-      };
+      final isLastUser = identical(m, _messages.last) && role == 'user';
+      final parts = <Map<String, dynamic>>[
+        {'text': m['content'] ?? ''},
+      ];
+      if (isLastUser) {
+        for (final attachment in attachments) {
+          parts.add({
+            'inlineData': {
+              'mimeType': attachment.mimeType,
+              'data': base64Encode(attachment.bytes),
+            },
+          });
+        }
+      }
+      return {'role': role, 'parts': parts};
     }).toList();
 
     final body = jsonEncode({
@@ -3501,10 +3743,38 @@ class _TimetableChatSheetState extends State<_TimetableChatSheet> {
     required String apiKey,
     required String model,
     required String systemPrompt,
+    List<_ChatAttachment> attachments = const [],
   }) async {
+    if (attachments.any((attachment) => !attachment.isImage)) {
+      throw Exception(
+        'API: This provider only supports image attachments in chat.',
+      );
+    }
+    final history = _historyForProvider();
     final messages = [
       {'role': 'system', 'content': systemPrompt},
-      ..._historyForProvider(),
+      ...history.asMap().entries.map((entry) {
+        final message = entry.value;
+        final isLast = entry.key == history.length - 1;
+        if (!isLast || message['role'] != 'user' || attachments.isEmpty) {
+          return message;
+        }
+        return {
+          'role': 'user',
+          'content': [
+            {'type': 'text', 'text': message['content'] ?? ''},
+            ...attachments.map(
+              (attachment) => {
+                'type': 'image_url',
+                'image_url': {
+                  'url':
+                      'data:${attachment.mimeType};base64,${base64Encode(attachment.bytes)}',
+                },
+              },
+            ),
+          ],
+        };
+      }),
     ];
 
     final body = jsonEncode({
@@ -3568,7 +3838,10 @@ class _TimetableChatSheetState extends State<_TimetableChatSheet> {
     throw Exception('API: ${AppL10n.of(appLocaleNotifier.value).aiNoReply}');
   }
 
-  Future<String> _requestProviderResponse(String systemPrompt) async {
+  Future<String> _requestProviderResponse(
+    String systemPrompt, {
+    List<_ChatAttachment> attachments = const [],
+  }) async {
     final l = AppL10n.of(appLocaleNotifier.value);
     final provider = _normalizeAiProvider(aiProvider);
     final apiKey = _activeAiApiKey().trim();
@@ -3592,6 +3865,7 @@ class _TimetableChatSheetState extends State<_TimetableChatSheet> {
           apiKey: apiKey,
           model: model,
           systemPrompt: systemPrompt,
+          attachments: attachments,
         );
       case 'mistral':
         return _requestOpenAiCompatibleResponse(
@@ -3599,6 +3873,7 @@ class _TimetableChatSheetState extends State<_TimetableChatSheet> {
           apiKey: apiKey,
           model: model,
           systemPrompt: systemPrompt,
+          attachments: attachments,
         );
       case 'custom':
         final baseUrl = aiCustomBaseUrl.trim();
@@ -3611,6 +3886,7 @@ class _TimetableChatSheetState extends State<_TimetableChatSheet> {
             endpoint: _geminiCompatibleEndpoint(baseUrl, model),
             apiKey: apiKey,
             systemPrompt: systemPrompt,
+            attachments: attachments,
           );
         }
         return _requestOpenAiCompatibleResponse(
@@ -3618,6 +3894,7 @@ class _TimetableChatSheetState extends State<_TimetableChatSheet> {
           apiKey: apiKey,
           model: model,
           systemPrompt: systemPrompt,
+          attachments: attachments,
         );
       case 'gemini':
       default:
@@ -3626,13 +3903,14 @@ class _TimetableChatSheetState extends State<_TimetableChatSheet> {
               'https://generativelanguage.googleapis.com/v1beta/models/$model:generateContent',
           apiKey: apiKey,
           systemPrompt: systemPrompt,
+          attachments: attachments,
         );
     }
   }
 
   Future<void> _send() async {
     final text = _inputController.text.trim();
-    if (text.isEmpty || _thinking) return;
+    if ((text.isEmpty && _pendingAttachments.isEmpty) || _thinking) return;
 
     if (_activeAiApiKey().trim().isEmpty) {
       final l = AppL10n.of(appLocaleNotifier.value);
@@ -3646,15 +3924,28 @@ class _TimetableChatSheetState extends State<_TimetableChatSheet> {
       return;
     }
 
+    final attachments = List<_ChatAttachment>.from(_pendingAttachments);
+    final attachmentLabel = attachments.isEmpty
+        ? ''
+        : '\n\nAttachments: ${attachments.map((a) => a.name).join(', ')}';
     _inputController.clear();
     setState(() {
-      _messages.add({'role': 'user', 'content': text});
+      _pendingAttachments.clear();
+      _messages.add({
+        'role': 'user',
+        'content': text.isEmpty
+            ? attachmentLabel.trim()
+            : '$text$attachmentLabel',
+      });
       _thinking = true;
     });
     _scrollToBottom();
 
     try {
-      final reply = await _requestProviderResponse(_resolvedSystemPrompt());
+      final reply = await _requestProviderResponse(
+        _resolvedSystemPrompt(),
+        attachments: attachments,
+      );
       setState(() {
         _messages.add({'role': 'assistant', 'content': reply});
       });
@@ -3861,63 +4152,103 @@ class _TimetableChatSheetState extends State<_TimetableChatSheet> {
 
               Padding(
                 padding: EdgeInsets.fromLTRB(16, 8, 16, bottom + 20),
-                child: Container(
-                  padding: const EdgeInsets.all(6),
-                  decoration: BoxDecoration(
-                    gradient: LinearGradient(
-                      colors: [
-                        cs.surfaceContainerHigh.withValues(alpha: 0.72),
-                        cs.surfaceContainerHighest.withValues(alpha: 0.5),
-                      ],
-                    ),
-                    borderRadius: BorderRadius.circular(28),
-                    border: Border.all(
-                      color: cs.outlineVariant.withValues(alpha: 0.3),
-                    ),
-                  ),
-                  child: Row(
-                    children: [
-                      Expanded(
-                        child: TextField(
-                          controller: _inputController,
-                          textInputAction: TextInputAction.send,
-                          onSubmitted: (_) => _send(),
-                          style: GoogleFonts.outfit(fontSize: 15),
-                          decoration: InputDecoration(
-                            hintText: AppL10n.of(
-                              appLocaleNotifier.value,
-                            ).aiInputHint,
-                            hintStyle: GoogleFonts.outfit(
-                              color: cs.onSurface.withValues(alpha: 0.38),
-                            ),
-                            filled: true,
-                            fillColor: Colors.transparent,
-                            contentPadding: const EdgeInsets.symmetric(
-                              horizontal: 16,
-                              vertical: 12,
-                            ),
-                            border: OutlineInputBorder(
-                              borderRadius: BorderRadius.circular(22),
-                              borderSide: BorderSide.none,
-                            ),
-                          ),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    if (_pendingAttachments.isNotEmpty) ...[
+                      SizedBox(
+                        height: 34,
+                        child: ListView.separated(
+                          scrollDirection: Axis.horizontal,
+                          itemCount: _pendingAttachments.length,
+                          separatorBuilder: (context, index) =>
+                              const SizedBox(width: 8),
+                          itemBuilder: (context, index) {
+                            final attachment = _pendingAttachments[index];
+                            return InputChip(
+                              avatar: Icon(
+                                attachment.isImage
+                                    ? Icons.image_rounded
+                                    : Icons.description_rounded,
+                                size: 16,
+                              ),
+                              label: Text(
+                                attachment.name,
+                                overflow: TextOverflow.ellipsis,
+                              ),
+                              onDeleted: () => setState(
+                                () => _pendingAttachments.removeAt(index),
+                              ),
+                            );
+                          },
                         ),
                       ),
-                      const SizedBox(width: 8),
-                      AnimatedOpacity(
-                        opacity: _thinking ? 0.4 : 1.0,
-                        duration: const Duration(milliseconds: 200),
-                        child: FilledButton(
-                          onPressed: _thinking ? null : _send,
-                          style: FilledButton.styleFrom(
-                            shape: const CircleBorder(),
-                            padding: const EdgeInsets.all(14),
-                          ),
-                          child: const Icon(Icons.send_rounded, size: 20),
-                        ),
-                      ),
+                      const SizedBox(height: 8),
                     ],
-                  ),
+                    Container(
+                      padding: const EdgeInsets.all(6),
+                      decoration: BoxDecoration(
+                        gradient: LinearGradient(
+                          colors: [
+                            cs.surfaceContainerHigh.withValues(alpha: 0.72),
+                            cs.surfaceContainerHighest.withValues(alpha: 0.5),
+                          ],
+                        ),
+                        borderRadius: BorderRadius.circular(28),
+                        border: Border.all(
+                          color: cs.outlineVariant.withValues(alpha: 0.3),
+                        ),
+                      ),
+                      child: Row(
+                        children: [
+                          IconButton(
+                            onPressed: _thinking ? null : _openAttachmentPicker,
+                            icon: const Icon(Icons.attach_file_rounded),
+                            tooltip: 'Attach',
+                          ),
+                          Expanded(
+                            child: TextField(
+                              controller: _inputController,
+                              textInputAction: TextInputAction.send,
+                              onSubmitted: (_) => _send(),
+                              style: GoogleFonts.outfit(fontSize: 15),
+                              decoration: InputDecoration(
+                                hintText: AppL10n.of(
+                                  appLocaleNotifier.value,
+                                ).aiInputHint,
+                                hintStyle: GoogleFonts.outfit(
+                                  color: cs.onSurface.withValues(alpha: 0.38),
+                                ),
+                                filled: true,
+                                fillColor: Colors.transparent,
+                                contentPadding: const EdgeInsets.symmetric(
+                                  horizontal: 16,
+                                  vertical: 12,
+                                ),
+                                border: OutlineInputBorder(
+                                  borderRadius: BorderRadius.circular(22),
+                                  borderSide: BorderSide.none,
+                                ),
+                              ),
+                            ),
+                          ),
+                          const SizedBox(width: 8),
+                          AnimatedOpacity(
+                            opacity: _thinking ? 0.4 : 1.0,
+                            duration: const Duration(milliseconds: 200),
+                            child: FilledButton(
+                              onPressed: _thinking ? null : _send,
+                              style: FilledButton.styleFrom(
+                                shape: const CircleBorder(),
+                                padding: const EdgeInsets.all(14),
+                              ),
+                              child: const Icon(Icons.send_rounded, size: 20),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ],
                 ),
               ),
             ],
@@ -4150,7 +4481,14 @@ class _DotState extends State<_Dot> with SingleTickerProviderStateMixin {
 }
 
 // --- DETAIL BOTTOM SHEET OPENER ---
-void _showLessonDetail(BuildContext context, dynamic lesson) {
+void _showLessonDetail(
+  BuildContext context,
+  dynamic lesson, {
+  Future<void> Function()? onMarkMissed,
+  Future<void> Function()? onMarkCancelled,
+  Future<void> Function()? onClearStatus,
+  VoidCallback? onEditManual,
+}) {
   HapticFeedback.mediumImpact();
   final subject = lesson['_subjectLong']?.toString().isNotEmpty == true
       ? lesson['_subjectLong'].toString()
@@ -4165,6 +4503,9 @@ void _showLessonDetail(BuildContext context, dynamic lesson) {
   final time =
       '${_formatScheduleTime(lesson['startTime'].toString())} – ${_formatScheduleTime(lesson['endTime'].toString())}';
   final isCancelled = (lesson['code'] ?? '') == 'cancelled';
+  final userStatus = LessonOccurrenceStatus.fromStorage(
+    lesson['_userStatus']?.toString(),
+  );
   final info = (lesson['info'] ?? lesson['substText'] ?? '').toString().trim();
   final lessonNr = lesson['lsnumber']?.toString() ?? '';
   final subjectKey = lesson['_subjectShort']?.toString() ?? '';
@@ -4183,6 +4524,11 @@ void _showLessonDetail(BuildContext context, dynamic lesson) {
       isCancelled: isCancelled,
       info: info,
       lessonNr: lessonNr,
+      userStatus: userStatus,
+      onMarkMissed: onMarkMissed,
+      onMarkCancelled: onMarkCancelled,
+      onClearStatus: onClearStatus,
+      onEditManual: onEditManual,
       onHideSubject: () {
         Navigator.of(context).pop();
         _hideSubject(subjectKey);
@@ -4231,6 +4577,11 @@ class _AnimatedLessonCard extends StatelessWidget {
 class _LessonDetailSheet extends StatelessWidget {
   final String subject, subjectShort, room, teacher, time, info, lessonNr;
   final bool isCancelled;
+  final LessonOccurrenceStatus? userStatus;
+  final Future<void> Function()? onMarkMissed;
+  final Future<void> Function()? onMarkCancelled;
+  final Future<void> Function()? onClearStatus;
+  final VoidCallback? onEditManual;
   final VoidCallback? onHideSubject;
 
   const _LessonDetailSheet({
@@ -4242,6 +4593,11 @@ class _LessonDetailSheet extends StatelessWidget {
     required this.isCancelled,
     required this.info,
     required this.lessonNr,
+    this.userStatus,
+    this.onMarkMissed,
+    this.onMarkCancelled,
+    this.onClearStatus,
+    this.onEditManual,
     this.onHideSubject,
   });
 
@@ -4306,6 +4662,9 @@ class _LessonDetailSheet extends StatelessWidget {
   Widget build(BuildContext context) {
     final cs = Theme.of(context).colorScheme;
     final l = AppL10n.of(appLocaleNotifier.value);
+    final isMissed = userStatus == LessonOccurrenceStatus.missed;
+    final effectiveCancelled =
+        isCancelled || userStatus == LessonOccurrenceStatus.cancelled;
     return _sheetSurface(
       context: context,
       blur: blurEnabledNotifier.value,
@@ -4332,25 +4691,29 @@ class _LessonDetailSheet extends StatelessWidget {
             ),
             const SizedBox(height: 20),
 
-            if (isCancelled)
+            if (effectiveCancelled)
               Container(
                 padding: const EdgeInsets.symmetric(
                   horizontal: 14,
                   vertical: 6,
                 ),
                 decoration: BoxDecoration(
-                  color: cs.errorContainer,
+                  color: cs.surfaceContainerHighest,
                   borderRadius: BorderRadius.circular(20),
                 ),
                 child: Row(
                   mainAxisSize: MainAxisSize.min,
                   children: [
-                    Icon(Icons.cancel_outlined, size: 16, color: cs.error),
+                    Icon(
+                      Icons.cancel_outlined,
+                      size: 16,
+                      color: cs.onSurfaceVariant,
+                    ),
                     const SizedBox(width: 6),
                     Text(
                       l.detailCancelled,
                       style: GoogleFonts.outfit(
-                        color: cs.error,
+                        color: cs.onSurfaceVariant,
                         fontWeight: FontWeight.w800,
                         fontSize: 13,
                       ),
@@ -4365,22 +4728,24 @@ class _LessonDetailSheet extends StatelessWidget {
                   vertical: 6,
                 ),
                 decoration: BoxDecoration(
-                  color: cs.tertiaryContainer,
+                  color: isMissed ? cs.errorContainer : cs.tertiaryContainer,
                   borderRadius: BorderRadius.circular(20),
                 ),
                 child: Row(
                   mainAxisSize: MainAxisSize.min,
                   children: [
                     Icon(
-                      Icons.check_circle_outline,
+                      isMissed
+                          ? Icons.event_busy_rounded
+                          : Icons.check_circle_outline,
                       size: 16,
-                      color: cs.tertiary,
+                      color: isMissed ? cs.error : cs.tertiary,
                     ),
                     const SizedBox(width: 6),
                     Text(
-                      l.detailRegular,
+                      isMissed ? 'Missed' : l.detailRegular,
                       style: GoogleFonts.outfit(
-                        color: cs.tertiary,
+                        color: isMissed ? cs.error : cs.tertiary,
                         fontWeight: FontWeight.w800,
                         fontSize: 13,
                       ),
@@ -4431,6 +4796,80 @@ class _LessonDetailSheet extends StatelessWidget {
             Divider(color: cs.outlineVariant.withValues(alpha: 0.5), height: 1),
             const SizedBox(height: 12),
 
+            OutlinedButton.icon(
+              onPressed: onEditManual == null
+                  ? null
+                  : () {
+                      Navigator.of(context).pop();
+                      onEditManual?.call();
+                    },
+              icon: const Icon(Icons.edit_calendar_rounded, size: 18),
+              label: Text(
+                'Edit lesson',
+                style: GoogleFonts.outfit(fontWeight: FontWeight.w600),
+              ),
+              style: OutlinedButton.styleFrom(
+                foregroundColor: cs.primary,
+                side: BorderSide(color: cs.primary.withValues(alpha: 0.45)),
+                minimumSize: const Size(double.infinity, 48),
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(16),
+                ),
+              ),
+            ),
+            const SizedBox(height: 8),
+            Row(
+              children: [
+                Expanded(
+                  child: FilledButton.tonalIcon(
+                    onPressed: onMarkMissed == null
+                        ? null
+                        : () {
+                            Navigator.of(context).pop();
+                            onMarkMissed?.call();
+                          },
+                    icon: const Icon(Icons.event_busy_rounded, size: 18),
+                    label: const Text('Missed'),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: FilledButton.tonalIcon(
+                    onPressed: onMarkCancelled == null
+                        ? null
+                        : () {
+                            Navigator.of(context).pop();
+                            onMarkCancelled?.call();
+                          },
+                    icon: const Icon(Icons.cancel_outlined, size: 18),
+                    label: const Text('Cancelled'),
+                  ),
+                ),
+              ],
+            ),
+            if (userStatus != null) ...[
+              const SizedBox(height: 8),
+              OutlinedButton.icon(
+                onPressed: onClearStatus == null
+                    ? null
+                    : () {
+                        Navigator.of(context).pop();
+                        onClearStatus?.call();
+                      },
+                icon: const Icon(Icons.restart_alt_rounded, size: 18),
+                label: Text(
+                  'Clear status',
+                  style: GoogleFonts.outfit(fontWeight: FontWeight.w600),
+                ),
+                style: OutlinedButton.styleFrom(
+                  minimumSize: const Size(double.infinity, 48),
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(16),
+                  ),
+                ),
+              ),
+            ],
+            const SizedBox(height: 8),
             OutlinedButton.icon(
               onPressed: onHideSubject,
               icon: const Icon(Icons.visibility_off_outlined, size: 18),
@@ -4507,10 +4946,13 @@ class LessonCard extends StatelessWidget {
               decoration: BoxDecoration(
                 color: isCancelled
                     ? (enabled
-                          ? Theme.of(
+                          ? Theme.of(context)
+                                .colorScheme
+                                .surfaceContainerHighest
+                                .withValues(alpha: 0.9)
+                          : Theme.of(
                               context,
-                            ).colorScheme.errorContainer.withValues(alpha: 0.9)
-                          : Theme.of(context).colorScheme.errorContainer)
+                            ).colorScheme.surfaceContainerHighest)
                     : (enabled
                           ? Theme.of(
                               context,
@@ -4601,8 +5043,8 @@ class LessonCard extends StatelessWidget {
                           appLocaleNotifier.value,
                         ).detailCancelledBadge,
                       ),
-                      backgroundColor: Theme.of(context).colorScheme.error,
-                      textColor: Theme.of(context).colorScheme.onError,
+                      backgroundColor: cs.surfaceContainerHighest,
+                      textColor: cs.onSurfaceVariant,
                     ),
                 ],
               ),
@@ -4615,13 +5057,602 @@ class LessonCard extends StatelessWidget {
 }
 
 // --- INFO ---
-class ManualInfoPage extends StatelessWidget {
+class ManualInfoPage extends StatefulWidget {
   const ManualInfoPage({super.key});
+
+  @override
+  State<ManualInfoPage> createState() => _ManualInfoPageState();
+}
+
+enum _TaskSortMode { dueDate, priority, status, subject }
+
+class _ManualInfoPageState extends State<ManualInfoPage> {
+  List<StudyTask> _tasks = [];
+  List<String> _availableTaskSubjects = [];
+  _TaskSortMode _taskSortMode = _TaskSortMode.dueDate;
+
+  @override
+  void initState() {
+    super.initState();
+    knownSubjectsNotifier.addListener(_refreshAvailableTaskSubjects);
+    subjectColorsNotifier.addListener(_refreshAvailableTaskSubjects);
+    _loadTasks();
+  }
+
+  @override
+  void dispose() {
+    knownSubjectsNotifier.removeListener(_refreshAvailableTaskSubjects);
+    subjectColorsNotifier.removeListener(_refreshAvailableTaskSubjects);
+    super.dispose();
+  }
+
+  List<String> _collectTaskSubjects([
+    List<ManualLessonDefinition> definitions = const [],
+  ]) {
+    final subjects = <String>{
+      ...knownSubjectsNotifier.value,
+      ...subjectColorsNotifier.value.keys,
+      ...definitions.map((lesson) {
+        final subject = lesson.subject.trim();
+        if (subject.isNotEmpty) return subject;
+        return lesson.subjectShort.trim();
+      }),
+    }..removeWhere((subject) => subject.trim().isEmpty);
+    return subjects.toList()
+      ..sort((a, b) => a.toLowerCase().compareTo(b.toLowerCase()));
+  }
+
+  void _refreshAvailableTaskSubjects() {
+    if (!mounted) return;
+    setState(() => _availableTaskSubjects = _collectTaskSubjects());
+  }
+
+  Future<void> _loadTasks() async {
+    final prefs = await SharedPreferences.getInstance();
+    final tasks = await StudyTaskService.loadTasks(prefs);
+    final definitions = await ManualScheduleService.loadDefinitions(prefs);
+    final subjects = _collectTaskSubjects(definitions);
+    if (mounted) {
+      setState(() {
+        _tasks = tasks;
+        _availableTaskSubjects = subjects;
+      });
+    }
+  }
+
+  Future<void> _saveTasks(List<StudyTask> tasks) async {
+    final prefs = await SharedPreferences.getInstance();
+    await StudyTaskService.saveTasks(prefs, tasks);
+    await ScheduleBackupService.writeCurrentState(
+      prefs,
+      tasks: tasks,
+      preserveExistingTasksWhenEmpty: false,
+    );
+    if (mounted) setState(() => _tasks = [...tasks]);
+  }
+
+  String _formatTaskDueDate(int value) {
+    if (value <= 0) return 'No deadline';
+    final raw = value.toString().padLeft(8, '0');
+    final date = DateTime.tryParse(
+      '${raw.substring(0, 4)}-${raw.substring(4, 6)}-${raw.substring(6, 8)}',
+    );
+    if (date == null) return 'No deadline';
+    return DateFormat.MMMEd(appLocaleNotifier.value).format(date);
+  }
+
+  int _dateToStorage(DateTime date) {
+    return int.parse(DateFormat('yyyyMMdd').format(date));
+  }
+
+  int _priorityRank(StudyTaskPriority priority) {
+    return switch (priority) {
+      StudyTaskPriority.high => 0,
+      StudyTaskPriority.normal => 1,
+      StudyTaskPriority.low => 2,
+    };
+  }
+
+  int _statusRank(StudyTaskStatus status) {
+    return switch (status) {
+      StudyTaskStatus.inProgress => 0,
+      StudyTaskStatus.todo => 1,
+      StudyTaskStatus.done => 2,
+    };
+  }
+
+  String _taskSortLabel(_TaskSortMode mode) {
+    return switch (mode) {
+      _TaskSortMode.dueDate => 'Deadline',
+      _TaskSortMode.priority => 'Priority',
+      _TaskSortMode.status => 'Status',
+      _TaskSortMode.subject => 'Subject',
+    };
+  }
+
+  IconData _taskSortIcon(_TaskSortMode mode) {
+    return switch (mode) {
+      _TaskSortMode.dueDate => Icons.event_rounded,
+      _TaskSortMode.priority => Icons.flag_rounded,
+      _TaskSortMode.status => Icons.pending_actions_rounded,
+      _TaskSortMode.subject => Icons.menu_book_rounded,
+    };
+  }
+
+  List<StudyTask> _sortedTasks(Iterable<StudyTask> source) {
+    final tasks = source.toList();
+    int tie(StudyTask a, StudyTask b) => StudyTaskService.compareTasks(a, b);
+    tasks.sort((a, b) {
+      switch (_taskSortMode) {
+        case _TaskSortMode.priority:
+          final byPriority = _priorityRank(
+            a.priority,
+          ).compareTo(_priorityRank(b.priority));
+          if (byPriority != 0) return byPriority;
+          return tie(a, b);
+        case _TaskSortMode.status:
+          final byStatus = _statusRank(
+            a.status,
+          ).compareTo(_statusRank(b.status));
+          if (byStatus != 0) return byStatus;
+          return tie(a, b);
+        case _TaskSortMode.subject:
+          final byOther = (a.subject.isEmpty ? 1 : 0).compareTo(
+            b.subject.isEmpty ? 1 : 0,
+          );
+          if (byOther != 0) return byOther;
+          final bySubject = a.subject.toLowerCase().compareTo(
+            b.subject.toLowerCase(),
+          );
+          if (bySubject != 0) return bySubject;
+          return tie(a, b);
+        case _TaskSortMode.dueDate:
+          return tie(a, b);
+      }
+    });
+    return tasks;
+  }
+
+  String _taskSubjectLabel(StudyTask task) {
+    final subject = task.subject.trim();
+    return subject.isEmpty ? 'Other' : subject;
+  }
+
+  Color _taskPriorityColor(ColorScheme cs, StudyTaskPriority priority) {
+    return switch (priority) {
+      StudyTaskPriority.high => cs.error,
+      StudyTaskPriority.low => cs.tertiary,
+      StudyTaskPriority.normal => cs.primary,
+    };
+  }
+
+  Map<String, List<StudyTask>> _tasksBySubject(List<StudyTask> tasks) {
+    final grouped = <String, List<StudyTask>>{};
+    for (final task in tasks) {
+      final label = _taskSubjectLabel(task);
+      grouped.putIfAbsent(label, () => []).add(task);
+    }
+    final entries = grouped.entries.toList()
+      ..sort((a, b) {
+        if (a.key == 'Other') return 1;
+        if (b.key == 'Other') return -1;
+        return a.key.toLowerCase().compareTo(b.key.toLowerCase());
+      });
+    return Map.fromEntries(entries);
+  }
+
+  Widget _buildTaskTile(
+    BuildContext context,
+    StudyTask task, {
+    required bool archived,
+  }) {
+    final cs = Theme.of(context).colorScheme;
+    final priorityColor = _taskPriorityColor(cs, task.priority);
+    return Container(
+      margin: const EdgeInsets.only(bottom: 10),
+      decoration: BoxDecoration(
+        color: archived
+            ? cs.surfaceContainerHighest.withValues(alpha: 0.58)
+            : cs.surfaceContainer,
+        borderRadius: BorderRadius.circular(18),
+        border: Border.all(
+          color: cs.outlineVariant.withValues(alpha: archived ? 0.28 : 0.35),
+        ),
+      ),
+      child: ListTile(
+        onTap: () => _openTaskSheet(existing: task),
+        leading: Checkbox(
+          value: archived,
+          onChanged: (_) async {
+            await _saveTasks([
+              ..._tasks.where((item) => item.id != task.id),
+              task.copyWith(
+                status: archived ? StudyTaskStatus.todo : StudyTaskStatus.done,
+              ),
+            ]);
+          },
+        ),
+        title: Text(
+          task.title,
+          style: GoogleFonts.outfit(
+            fontWeight: FontWeight.w800,
+            decoration: archived ? TextDecoration.lineThrough : null,
+          ),
+        ),
+        subtitle: Text(
+          [
+            _taskSubjectLabel(task),
+            _formatTaskDueDate(task.dueDate),
+            if (!archived && task.notes.isNotEmpty) task.notes,
+          ].join(' • '),
+          maxLines: archived ? 1 : 2,
+          overflow: TextOverflow.ellipsis,
+          style: GoogleFonts.outfit(fontWeight: FontWeight.w500),
+        ),
+        trailing: archived
+            ? IconButton(
+                tooltip: 'Delete',
+                icon: const Icon(Icons.delete_outline_rounded),
+                onPressed: () async {
+                  await _saveTasks(
+                    _tasks.where((item) => item.id != task.id).toList(),
+                  );
+                },
+              )
+            : Icon(
+                task.status == StudyTaskStatus.inProgress
+                    ? Icons.pending_actions_rounded
+                    : Icons.flag_rounded,
+                color: priorityColor,
+              ),
+      ),
+    );
+  }
+
+  List<Widget> _buildTaskList(
+    BuildContext context,
+    List<StudyTask> tasks, {
+    required bool archived,
+  }) {
+    if (_taskSortMode != _TaskSortMode.subject) {
+      return tasks
+          .map((task) => _buildTaskTile(context, task, archived: archived))
+          .toList();
+    }
+
+    final cs = Theme.of(context).colorScheme;
+    return _tasksBySubject(tasks).entries.map((entry) {
+      return Container(
+        margin: const EdgeInsets.only(bottom: 12),
+        padding: const EdgeInsets.fromLTRB(12, 10, 12, 2),
+        decoration: BoxDecoration(
+          color: cs.surfaceContainerLow.withValues(alpha: 0.74),
+          borderRadius: BorderRadius.circular(20),
+          border: Border.all(color: cs.outlineVariant.withValues(alpha: 0.32)),
+        ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                Container(
+                  width: 4,
+                  height: 18,
+                  decoration: BoxDecoration(
+                    color: entry.key == 'Other' ? cs.outline : cs.primary,
+                    borderRadius: BorderRadius.circular(999),
+                  ),
+                ),
+                const SizedBox(width: 9),
+                Expanded(
+                  child: Text(
+                    entry.key,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: GoogleFonts.outfit(
+                      fontSize: 15,
+                      fontWeight: FontWeight.w900,
+                      color: cs.onSurface,
+                    ),
+                  ),
+                ),
+                Text(
+                  '${entry.value.length}',
+                  style: GoogleFonts.outfit(
+                    fontSize: 12,
+                    fontWeight: FontWeight.w800,
+                    color: cs.onSurfaceVariant,
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 10),
+            ...entry.value.map(
+              (task) => _buildTaskTile(context, task, archived: archived),
+            ),
+          ],
+        ),
+      );
+    }).toList();
+  }
+
+  Future<void> _openTaskSheet({StudyTask? existing}) async {
+    final titleCtrl = TextEditingController(text: existing?.title ?? '');
+    final notesCtrl = TextEditingController(text: existing?.notes ?? '');
+    final subjectOptions = {
+      ..._availableTaskSubjects,
+      if ((existing?.subject ?? '').trim().isNotEmpty) existing!.subject.trim(),
+    }.toList()..sort((a, b) => a.toLowerCase().compareTo(b.toLowerCase()));
+    var selectedSubject = (existing?.subject ?? '').trim();
+    if (!subjectOptions.contains(selectedSubject)) selectedSubject = '';
+    var dueDate = existing?.dueDate ?? 0;
+    var priority = existing?.priority ?? StudyTaskPriority.normal;
+    var status = existing?.status ?? StudyTaskStatus.todo;
+
+    await showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      useSafeArea: true,
+      backgroundColor: Colors.transparent,
+      sheetAnimationStyle: _kBottomSheetAnimationStyle,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setDlg) {
+          final cs = Theme.of(ctx).colorScheme;
+          InputDecoration decoration(String label, IconData icon) {
+            return InputDecoration(
+              labelText: label,
+              prefixIcon: Icon(icon),
+              filled: true,
+              fillColor: cs.surfaceContainerHighest.withValues(alpha: 0.45),
+              border: OutlineInputBorder(
+                borderRadius: BorderRadius.circular(16),
+                borderSide: BorderSide.none,
+              ),
+            );
+          }
+
+          Future<void> pickDueDate() async {
+            final now = DateTime.now();
+            final initial = dueDate > 0
+                ? DateTime.tryParse(
+                        '${dueDate.toString().substring(0, 4)}-${dueDate.toString().substring(4, 6)}-${dueDate.toString().substring(6, 8)}',
+                      ) ??
+                      now
+                : now;
+            final picked = await showDatePicker(
+              context: ctx,
+              initialDate: initial,
+              firstDate: DateTime(now.year - 1),
+              lastDate: DateTime(now.year + 5),
+            );
+            if (picked != null) {
+              setDlg(() => dueDate = _dateToStorage(picked));
+            }
+          }
+
+          return Padding(
+            padding: EdgeInsets.only(
+              bottom: MediaQuery.of(ctx).viewInsets.bottom,
+            ),
+            child: _glassContainer(
+              context: ctx,
+              borderRadius: const BorderRadius.vertical(
+                top: Radius.circular(32),
+              ),
+              child: Padding(
+                padding: const EdgeInsets.fromLTRB(18, 12, 18, 12),
+                child: SingleChildScrollView(
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Container(
+                        width: 42,
+                        height: 4,
+                        decoration: BoxDecoration(
+                          color: cs.outlineVariant,
+                          borderRadius: BorderRadius.circular(999),
+                        ),
+                      ),
+                      const SizedBox(height: 14),
+                      Text(
+                        existing == null ? 'Add task' : 'Edit task',
+                        style: GoogleFonts.outfit(
+                          fontWeight: FontWeight.w800,
+                          fontSize: 18,
+                        ),
+                      ),
+                      const SizedBox(height: 14),
+                      TextField(
+                        controller: titleCtrl,
+                        decoration: decoration('Title', Icons.task_alt_rounded),
+                      ),
+                      const SizedBox(height: 12),
+                      DropdownButtonFormField<String>(
+                        initialValue: selectedSubject,
+                        decoration: decoration(
+                          'Subject',
+                          Icons.menu_book_rounded,
+                        ),
+                        items: [
+                          const DropdownMenuItem(
+                            value: '',
+                            child: Text('Other'),
+                          ),
+                          ...subjectOptions.map(
+                            (subject) => DropdownMenuItem(
+                              value: subject,
+                              child: Text(subject),
+                            ),
+                          ),
+                        ],
+                        onChanged: (value) {
+                          setDlg(() => selectedSubject = value ?? '');
+                        },
+                      ),
+                      const SizedBox(height: 12),
+                      InkWell(
+                        borderRadius: BorderRadius.circular(16),
+                        onTap: pickDueDate,
+                        child: InputDecorator(
+                          decoration: decoration(
+                            'Deadline',
+                            Icons.event_rounded,
+                          ),
+                          child: Text(_formatTaskDueDate(dueDate)),
+                        ),
+                      ),
+                      const SizedBox(height: 12),
+                      Row(
+                        children: [
+                          Expanded(
+                            child: DropdownButtonFormField<StudyTaskPriority>(
+                              initialValue: priority,
+                              decoration: decoration(
+                                'Priority',
+                                Icons.priority_high_rounded,
+                              ),
+                              items: const [
+                                DropdownMenuItem(
+                                  value: StudyTaskPriority.low,
+                                  child: Text('Low'),
+                                ),
+                                DropdownMenuItem(
+                                  value: StudyTaskPriority.normal,
+                                  child: Text('Normal'),
+                                ),
+                                DropdownMenuItem(
+                                  value: StudyTaskPriority.high,
+                                  child: Text('High'),
+                                ),
+                              ],
+                              onChanged: (value) {
+                                if (value != null) {
+                                  setDlg(() => priority = value);
+                                }
+                              },
+                            ),
+                          ),
+                          const SizedBox(width: 12),
+                          Expanded(
+                            child: DropdownButtonFormField<StudyTaskStatus>(
+                              initialValue: status,
+                              decoration: decoration(
+                                'Status',
+                                Icons.check_circle_outline,
+                              ),
+                              items: const [
+                                DropdownMenuItem(
+                                  value: StudyTaskStatus.todo,
+                                  child: Text('To do'),
+                                ),
+                                DropdownMenuItem(
+                                  value: StudyTaskStatus.inProgress,
+                                  child: Text('In progress'),
+                                ),
+                                DropdownMenuItem(
+                                  value: StudyTaskStatus.done,
+                                  child: Text('Done'),
+                                ),
+                              ],
+                              onChanged: (value) {
+                                if (value != null) setDlg(() => status = value);
+                              },
+                            ),
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 12),
+                      TextField(
+                        controller: notesCtrl,
+                        maxLines: 3,
+                        decoration: decoration('Notes', Icons.notes_rounded),
+                      ),
+                      const SizedBox(height: 14),
+                      Row(
+                        mainAxisAlignment: MainAxisAlignment.end,
+                        children: [
+                          if (existing != null)
+                            TextButton(
+                              onPressed: () async {
+                                Navigator.pop(ctx);
+                                await _saveTasks(
+                                  _tasks
+                                      .where((task) => task.id != existing.id)
+                                      .toList(),
+                                );
+                              },
+                              child: Text(
+                                'Delete',
+                                style: GoogleFonts.outfit(
+                                  fontWeight: FontWeight.w700,
+                                  color: cs.error,
+                                ),
+                              ),
+                            ),
+                          TextButton(
+                            onPressed: () => Navigator.pop(ctx),
+                            child: Text(
+                              'Cancel',
+                              style: GoogleFonts.outfit(
+                                fontWeight: FontWeight.w700,
+                              ),
+                            ),
+                          ),
+                          FilledButton(
+                            onPressed: () async {
+                              final title = titleCtrl.text.trim();
+                              if (title.isEmpty) return;
+                              final updated = StudyTask(
+                                id:
+                                    existing?.id ??
+                                    DateTime.now().microsecondsSinceEpoch
+                                        .toString(),
+                                title: title,
+                                subject: selectedSubject.trim(),
+                                dueDate: dueDate,
+                                notes: notesCtrl.text.trim(),
+                                priority: priority,
+                                status: status,
+                              );
+                              final next = [
+                                ..._tasks.where(
+                                  (task) => task.id != updated.id,
+                                ),
+                                updated,
+                              ];
+                              Navigator.pop(ctx);
+                              await _saveTasks(next);
+                            },
+                            child: Text(
+                              'Save',
+                              style: GoogleFonts.outfit(
+                                fontWeight: FontWeight.w700,
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+          );
+        },
+      ),
+    );
+  }
 
   @override
   Widget build(BuildContext context) {
     final l = AppL10n.of(appLocaleNotifier.value);
     final cs = Theme.of(context).colorScheme;
+    final activeTasks = _sortedTasks(
+      _tasks.where((task) => task.status != StudyTaskStatus.done),
+    );
+    final archivedTasks = _sortedTasks(
+      _tasks.where((task) => task.status == StudyTaskStatus.done),
+    );
 
     return Scaffold(
       appBar: RoundedBlurAppBar(
@@ -4634,39 +5665,99 @@ class ManualInfoPage extends StatelessWidget {
         physics: const AlwaysScrollableScrollPhysics(),
         padding: const EdgeInsets.fromLTRB(16, 20, 16, 150),
         children: [
-          Container(
-            padding: const EdgeInsets.all(18),
-            decoration: BoxDecoration(
-              color: cs.surfaceContainer,
-              borderRadius: BorderRadius.circular(18),
-              border: Border.all(
-                color: cs.outlineVariant.withValues(alpha: 0.35),
-              ),
-            ),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Icon(Icons.info_outline_rounded, color: cs.primary, size: 28),
-                const SizedBox(height: 12),
-                Text(
-                  l.infoEmpty,
+          Row(
+            children: [
+              Expanded(
+                child: Text(
+                  'Tasks',
                   style: GoogleFonts.outfit(
-                    fontSize: 18,
-                    fontWeight: FontWeight.w800,
+                    fontSize: 24,
+                    fontWeight: FontWeight.w900,
                   ),
                 ),
-                const SizedBox(height: 6),
+              ),
+              PopupMenuButton<_TaskSortMode>(
+                tooltip: 'Sort tasks',
+                initialValue: _taskSortMode,
+                onSelected: (value) => setState(() => _taskSortMode = value),
+                itemBuilder: (context) => _TaskSortMode.values
+                    .map(
+                      (mode) => PopupMenuItem(
+                        value: mode,
+                        child: Row(
+                          children: [
+                            Icon(_taskSortIcon(mode), size: 18),
+                            const SizedBox(width: 10),
+                            Text(_taskSortLabel(mode)),
+                          ],
+                        ),
+                      ),
+                    )
+                    .toList(),
+                icon: const Icon(Icons.sort_rounded),
+              ),
+              const SizedBox(width: 6),
+              IconButton.filledTonal(
+                onPressed: () => _openTaskSheet(),
+                icon: const Icon(Icons.add_rounded),
+                tooltip: 'Add task',
+              ),
+            ],
+          ),
+          const SizedBox(height: 12),
+          if (activeTasks.isEmpty)
+            Container(
+              padding: const EdgeInsets.all(18),
+              decoration: BoxDecoration(
+                color: cs.surfaceContainer,
+                borderRadius: BorderRadius.circular(18),
+                border: Border.all(
+                  color: cs.outlineVariant.withValues(alpha: 0.35),
+                ),
+              ),
+              child: Row(
+                children: [
+                  Icon(
+                    Icons.assignment_turned_in_rounded,
+                    color: cs.primary,
+                    size: 28,
+                  ),
+                  const SizedBox(width: 14),
+                  Expanded(
+                    child: Text(
+                      _tasks.isEmpty
+                          ? 'No tasks yet. Add homework, projects, or study notes.'
+                          : 'No active tasks. Finished tasks are in the archive.',
+                      style: GoogleFonts.outfit(
+                        color: cs.onSurfaceVariant,
+                        fontWeight: FontWeight.w600,
+                        height: 1.35,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            )
+          else
+            ..._buildTaskList(context, activeTasks, archived: false),
+          if (archivedTasks.isNotEmpty) ...[
+            const SizedBox(height: 22),
+            Row(
+              children: [
+                Icon(Icons.archive_rounded, color: cs.secondary, size: 22),
+                const SizedBox(width: 8),
                 Text(
-                  l.infoEmptyHint,
+                  'Archive',
                   style: GoogleFonts.outfit(
-                    color: cs.onSurfaceVariant,
-                    fontWeight: FontWeight.w500,
-                    height: 1.35,
+                    fontSize: 20,
+                    fontWeight: FontWeight.w900,
                   ),
                 ),
               ],
             ),
-          ),
+            const SizedBox(height: 10),
+            ..._buildTaskList(context, archivedTasks, archived: true),
+          ],
         ],
       ),
     );
@@ -4894,6 +5985,7 @@ class _SettingsPageState extends State<SettingsPage> {
       aiModel = models.first;
       await prefs.setString('aiModel', aiModel);
     }
+    await ScheduleBackupService.writeCurrentState(prefs);
     await _loadPrefs();
   }
 
@@ -4901,6 +5993,7 @@ class _SettingsPageState extends State<SettingsPage> {
     aiModel = model;
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString('aiModel', aiModel);
+    await ScheduleBackupService.writeCurrentState(prefs);
     await _loadPrefs();
   }
 
@@ -4917,6 +6010,7 @@ class _SettingsPageState extends State<SettingsPage> {
       aiModel = models.first;
       await prefs.setString('aiModel', aiModel);
     }
+    await ScheduleBackupService.writeCurrentState(prefs);
     await _loadPrefs();
   }
 
@@ -4924,6 +6018,7 @@ class _SettingsPageState extends State<SettingsPage> {
     aiCustomBaseUrl = value;
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString('aiCustomBaseUrl', value);
+    await ScheduleBackupService.writeCurrentState(prefs);
     await _loadPrefs();
   }
 
@@ -4931,6 +6026,7 @@ class _SettingsPageState extends State<SettingsPage> {
     aiSystemPromptTemplate = value;
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString('aiSystemPromptTemplate', value);
+    await ScheduleBackupService.writeCurrentState(prefs);
     await _loadPrefs();
   }
 
@@ -5495,24 +6591,28 @@ class _SettingsPageState extends State<SettingsPage> {
     appLocaleNotifier.value = code;
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString('appLocale', code);
+    await ScheduleBackupService.writeCurrentState(prefs);
   }
 
   Future<void> _setThemeMode(ThemeMode mode) async {
     themeModeNotifier.value = mode;
     final prefs = await SharedPreferences.getInstance();
     await prefs.setInt('themeMode', ThemeMode.values.indexOf(mode));
+    await ScheduleBackupService.writeCurrentState(prefs);
   }
 
   Future<void> _setShowCancelled(bool v) async {
     showCancelledNotifier.value = v;
     final prefs = await SharedPreferences.getInstance();
     await prefs.setBool('showCancelled', v);
+    await ScheduleBackupService.writeCurrentState(prefs);
   }
 
   Future<void> _setBackgroundAnimations(bool v) async {
     backgroundAnimationsNotifier.value = v;
     final prefs = await SharedPreferences.getInstance();
     await prefs.setBool('backgroundAnimations', v);
+    await ScheduleBackupService.writeCurrentState(prefs);
   }
 
   Future<void> _setBackgroundAnimationStyle(int style) async {
@@ -5520,24 +6620,28 @@ class _SettingsPageState extends State<SettingsPage> {
     backgroundAnimationStyleNotifier.value = normalized;
     final prefs = await SharedPreferences.getInstance();
     await prefs.setInt('backgroundAnimationStyle', normalized);
+    await ScheduleBackupService.writeCurrentState(prefs);
   }
 
   Future<void> _setBackgroundGyroscope(bool v) async {
     backgroundGyroscopeNotifier.value = v;
     final prefs = await SharedPreferences.getInstance();
     await prefs.setBool('backgroundGyroscope', v);
+    await ScheduleBackupService.writeCurrentState(prefs);
   }
 
   Future<void> _setBlurEnabled(bool v) async {
     blurEnabledNotifier.value = v;
     final prefs = await SharedPreferences.getInstance();
     await prefs.setBool('blurEnabled', v);
+    await ScheduleBackupService.writeCurrentState(prefs);
   }
 
   Future<void> _setProgressivePush(bool v) async {
     progressivePushNotifier.value = v;
     final prefs = await SharedPreferences.getInstance();
     await prefs.setBool('progressivePush', v);
+    await ScheduleBackupService.writeCurrentState(prefs);
     if (!v) {
       await NotificationService().cancelNotification(
         kCurrentLessonNotificationId,
@@ -5551,6 +6655,7 @@ class _SettingsPageState extends State<SettingsPage> {
     dailyBriefingPushNotifier.value = v;
     final prefs = await SharedPreferences.getInstance();
     await prefs.setBool('dailyBriefingPush', v);
+    await ScheduleBackupService.writeCurrentState(prefs);
     if (!v) {
       await NotificationService().cancelNotification(
         kDailyBriefingNotificationId,
@@ -5564,6 +6669,7 @@ class _SettingsPageState extends State<SettingsPage> {
     importantChangesPushNotifier.value = v;
     final prefs = await SharedPreferences.getInstance();
     await prefs.setBool('importantChangesPush', v);
+    await ScheduleBackupService.writeCurrentState(prefs);
   }
 
   void _showLanguageDialog() {

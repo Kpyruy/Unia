@@ -5,7 +5,6 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.ContentUris
-import android.content.ContentValues
 import android.content.Intent
 import android.graphics.Color
 import android.net.Uri
@@ -64,70 +63,93 @@ class MainActivity : FlutterActivity() {
 	}
 
 	private fun legacyBackupFile(): File {
+		return legacyBackupFile(BACKUP_FILE_NAME)
+	}
+
+	private fun legacyBackupFile(fileName: String): File {
 		return File(
 			File(
 				Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS),
 				BACKUP_FOLDER_NAME,
 			),
-			BACKUP_FILE_NAME,
+			fileName,
 		)
 	}
 
-	private fun findBackupUri(): Uri? {
+	private fun persistentBackupFile(fileName: String = BACKUP_FILE_NAME): File {
+		val mediaRoot = externalMediaDirs.firstOrNull()
+		val backupRoot = if (mediaRoot != null) {
+			File(mediaRoot, BACKUP_FOLDER_NAME)
+		} else {
+			File(
+				Environment.getExternalStorageDirectory(),
+				"Android/media/$packageName/$BACKUP_FOLDER_NAME",
+			)
+		}
+		return File(backupRoot, fileName)
+	}
+
+	private fun numberedBackupFileName(index: Int): String {
+		return "unia_schedule_backup_$index.json"
+	}
+
+	private fun findBackupUri(fileName: String = BACKUP_FILE_NAME): Uri? {
 		if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return null
-		val projection = arrayOf(MediaStore.MediaColumns._ID)
-		val selection =
-			"${MediaStore.MediaColumns.DISPLAY_NAME}=? AND ${MediaStore.MediaColumns.RELATIVE_PATH}=?"
-		val args = arrayOf(BACKUP_FILE_NAME, backupRelativePath())
+		val projection = arrayOf(
+			MediaStore.MediaColumns._ID,
+			MediaStore.MediaColumns.DISPLAY_NAME,
+			MediaStore.MediaColumns.RELATIVE_PATH,
+		)
+		val targetPath = backupRelativePath()
 
 		contentResolver.query(
 			MediaStore.Downloads.EXTERNAL_CONTENT_URI,
 			projection,
-			selection,
-			args,
+			null,
+			null,
 			null,
 		)?.use { cursor ->
-			if (cursor.moveToFirst()) {
-				val id = cursor.getLong(cursor.getColumnIndexOrThrow(MediaStore.MediaColumns._ID))
-				return ContentUris.withAppendedId(MediaStore.Downloads.EXTERNAL_CONTENT_URI, id)
+			val idColumn = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns._ID)
+			val nameColumn = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns.DISPLAY_NAME)
+			val pathColumn = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns.RELATIVE_PATH)
+			while (cursor.moveToNext()) {
+				val name = cursor.getString(nameColumn).orEmpty()
+				val path = cursor.getString(pathColumn).orEmpty()
+				if (name == fileName && path == targetPath) {
+					val id = cursor.getLong(idColumn)
+					return ContentUris.withAppendedId(MediaStore.Downloads.EXTERNAL_CONTENT_URI, id)
+				}
 			}
 		}
 		return null
 	}
 
+	private fun nextNumberedBackupFileName(): String {
+		var index = 1
+		while (true) {
+			val candidate = numberedBackupFileName(index)
+			if (!persistentBackupFile(candidate).exists()) {
+				return candidate
+			}
+			index += 1
+		}
+	}
+
 	private fun writeScheduleBackup(content: String): Boolean {
 		return try {
-			if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-				var isNewFile = false
-				val uri = findBackupUri() ?: run {
-					isNewFile = true
-					val values = ContentValues().apply {
-						put(MediaStore.MediaColumns.DISPLAY_NAME, BACKUP_FILE_NAME)
-						put(MediaStore.MediaColumns.MIME_TYPE, "application/json")
-						put(MediaStore.MediaColumns.RELATIVE_PATH, backupRelativePath())
-						put(MediaStore.MediaColumns.IS_PENDING, 1)
-					}
-					contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
-				} ?: return false
+			val file = persistentBackupFile()
+			val existingContent = if (file.exists()) file.readText(Charsets.UTF_8) else null
+			if (existingContent == content) return true
 
-				contentResolver.openOutputStream(uri, "wt")?.bufferedWriter(Charsets.UTF_8)
-					?.use { writer ->
-						writer.write(content)
-					} ?: return false
-
-				if (isNewFile) {
-					val values = ContentValues().apply {
-						put(MediaStore.MediaColumns.IS_PENDING, 0)
-					}
-					contentResolver.update(uri, values, null, null)
-				}
-				true
-			} else {
-				val file = legacyBackupFile()
-				file.parentFile?.mkdirs()
-				file.writeText(content, Charsets.UTF_8)
-				true
+			file.parentFile?.mkdirs()
+			if (existingContent != null && existingContent.isNotBlank()) {
+				persistentBackupFile(nextNumberedBackupFileName()).writeText(
+					existingContent,
+					Charsets.UTF_8,
+				)
 			}
+			file.writeText(content, Charsets.UTF_8)
+			true
 		} catch (_: Throwable) {
 			false
 		}
@@ -135,6 +157,9 @@ class MainActivity : FlutterActivity() {
 
 	private fun readScheduleBackup(): String? {
 		return try {
+			val file = persistentBackupFile()
+			if (file.exists()) return file.readText(Charsets.UTF_8)
+
 			if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
 				val uri = findBackupUri() ?: return null
 				contentResolver.openInputStream(uri)?.bufferedReader(Charsets.UTF_8)

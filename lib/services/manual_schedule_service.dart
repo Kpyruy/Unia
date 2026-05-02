@@ -53,7 +53,8 @@ class ManualScheduleService {
   static List<ManualLessonDefinition> decodeBackupJson(String raw) {
     final decoded = jsonDecode(raw);
     if (decoded is! Map) return const [];
-    if ((decoded['schemaVersion'] as num?)?.toInt() != backupSchemaVersion) {
+    final schemaVersion = (decoded['schemaVersion'] as num?)?.toInt();
+    if (schemaVersion != backupSchemaVersion && schemaVersion != 2) {
       return const [];
     }
     final lessons = decoded['manualLessons'];
@@ -84,8 +85,10 @@ class ManualScheduleService {
     };
 
     final mondayDate = DateTime(monday.year, monday.month, monday.day);
+    final weekNumber = _isoWeekNumber(mondayDate);
     for (final lesson in definitions) {
       if (lesson.dayIndex < 0 || lesson.dayIndex > 4) continue;
+      if (!lesson.recurrence.includesIsoWeek(weekNumber)) continue;
       final date = mondayDate.add(Duration(days: lesson.dayIndex));
       week[lesson.dayIndex]!.add(lesson.toWeekLesson(date));
     }
@@ -119,6 +122,43 @@ class ManualScheduleService {
     if (definition.subject.trim().isEmpty) return false;
     return true;
   }
+
+  static int _isoWeekNumber(DateTime date) {
+    final normalized = DateTime(date.year, date.month, date.day);
+    final thursday = normalized.add(
+      Duration(days: DateTime.thursday - normalized.weekday),
+    );
+    final firstThursday = DateTime(thursday.year, 1, 4);
+    final firstWeekThursday = firstThursday.add(
+      Duration(days: DateTime.thursday - firstThursday.weekday),
+    );
+    return 1 + thursday.difference(firstWeekThursday).inDays ~/ 7;
+  }
+}
+
+enum ManualLessonRecurrence {
+  everyWeek('every_week'),
+  oddWeeks('odd_weeks'),
+  evenWeeks('even_weeks');
+
+  const ManualLessonRecurrence(this.storageValue);
+
+  final String storageValue;
+
+  static ManualLessonRecurrence fromStorage(String? value) {
+    for (final recurrence in values) {
+      if (recurrence.storageValue == value) return recurrence;
+    }
+    return ManualLessonRecurrence.everyWeek;
+  }
+
+  bool includesIsoWeek(int weekNumber) {
+    return switch (this) {
+      ManualLessonRecurrence.everyWeek => true,
+      ManualLessonRecurrence.oddWeeks => weekNumber.isOdd,
+      ManualLessonRecurrence.evenWeeks => weekNumber.isEven,
+    };
+  }
 }
 
 class ManualLessonDefinition {
@@ -130,6 +170,7 @@ class ManualLessonDefinition {
   final String subjectShort;
   final String teacher;
   final String room;
+  final ManualLessonRecurrence recurrence;
 
   const ManualLessonDefinition({
     required this.id,
@@ -140,6 +181,7 @@ class ManualLessonDefinition {
     required this.subjectShort,
     required this.teacher,
     required this.room,
+    this.recurrence = ManualLessonRecurrence.everyWeek,
   });
 
   factory ManualLessonDefinition.fromJson(Map<String, dynamic> json) {
@@ -152,6 +194,9 @@ class ManualLessonDefinition {
       subjectShort: json['subjectShort']?.toString() ?? '',
       teacher: json['teacher']?.toString() ?? '',
       room: json['room']?.toString() ?? '',
+      recurrence: ManualLessonRecurrence.fromStorage(
+        json['recurrence']?.toString(),
+      ),
     );
   }
 
@@ -164,6 +209,7 @@ class ManualLessonDefinition {
     'subjectShort': subjectShort,
     'teacher': teacher,
     'room': room,
+    'recurrence': recurrence.storageValue,
   };
 
   Map<String, dynamic> toWeekLesson(DateTime date) => {
@@ -187,6 +233,7 @@ class ManualLessonDefinition {
     String? subjectShort,
     String? teacher,
     String? room,
+    ManualLessonRecurrence? recurrence,
   }) {
     return ManualLessonDefinition(
       id: id ?? this.id,
@@ -197,6 +244,7 @@ class ManualLessonDefinition {
       subjectShort: subjectShort ?? this.subjectShort,
       teacher: teacher ?? this.teacher,
       room: room ?? this.room,
+      recurrence: recurrence ?? this.recurrence,
     );
   }
 
@@ -211,7 +259,8 @@ class ManualLessonDefinition {
             subject == other.subject &&
             subjectShort == other.subjectShort &&
             teacher == other.teacher &&
-            room == other.room;
+            room == other.room &&
+            recurrence == other.recurrence;
   }
 
   @override
@@ -224,5 +273,6 @@ class ManualLessonDefinition {
     subjectShort,
     teacher,
     room,
+    recurrence,
   );
 }

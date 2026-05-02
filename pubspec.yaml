@@ -3,7 +3,7 @@ description: "A manual timetable app for lessons, exams, homework, and study pla
 
 publish_to: 'none'
 
-version: 0.1.1+3
+version: 0.1.1+10
 
 environment:
   sdk: ^3.11.0

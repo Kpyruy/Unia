@@ -596,6 +596,7 @@ class _OnboardingFlowState extends State<OnboardingFlow> {
 
     await prefs.setBool('onboardingCompleted', true);
     await prefs.setBool('tutorialCompleted', false);
+    await ScheduleBackupService.writeCurrentState(prefs);
 
     if (!mounted) return;
     Navigator.of(context).pushReplacement(

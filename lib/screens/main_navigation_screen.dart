@@ -380,8 +380,8 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
                         const SizedBox(width: 4),
                         _navIconBtn(
                           cs: cs,
-                          icon: Icons.campaign_outlined,
-                          selectedIcon: Icons.campaign_rounded,
+                          icon: Icons.fact_check_outlined,
+                          selectedIcon: Icons.fact_check_rounded,
                           selected: _selectedIndex == 2,
                           onTap: () => _onNavTap(2),
                           tutorialHighlight: _isTutorialTarget(2),

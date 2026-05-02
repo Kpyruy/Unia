@@ -46,6 +46,45 @@ void main() {
     expect(week[2]!.single['date'], 20260506);
   });
 
+  test('buildWeek filters lessons by ISO week recurrence parity', () {
+    final oddWeekMonday = DateTime(2026, 1, 12);
+    final evenWeekMonday = DateTime(2026, 1, 5);
+    const oddLesson = ManualLessonDefinition(
+      id: 'odd',
+      dayIndex: 0,
+      startTime: 800,
+      endTime: 930,
+      subject: 'Odd Seminar',
+      subjectShort: 'ODD',
+      teacher: '',
+      room: '',
+      recurrence: ManualLessonRecurrence.oddWeeks,
+    );
+    const evenLesson = ManualLessonDefinition(
+      id: 'even',
+      dayIndex: 0,
+      startTime: 1000,
+      endTime: 1130,
+      subject: 'Even Lab',
+      subjectShort: 'EVN',
+      teacher: '',
+      room: '',
+      recurrence: ManualLessonRecurrence.evenWeeks,
+    );
+
+    final oddWeek = ManualScheduleService.buildWeek(oddWeekMonday, [
+      oddLesson,
+      evenLesson,
+    ]);
+    final evenWeek = ManualScheduleService.buildWeek(evenWeekMonday, [
+      oddLesson,
+      evenLesson,
+    ]);
+
+    expect(oddWeek[0]!.map((lesson) => lesson['_manualId']), ['odd']);
+    expect(evenWeek[0]!.map((lesson) => lesson['_manualId']), ['even']);
+  });
+
   test(
     'saveDefinitions round trips manual lessons through preferences',
     () async {
@@ -60,6 +99,7 @@ void main() {
         subjectShort: 'HI',
         teacher: 'Grace Hopper',
         room: 'C303',
+        recurrence: ManualLessonRecurrence.evenWeeks,
       );
 
       await ManualScheduleService.saveDefinitions(prefs, [lesson]);
